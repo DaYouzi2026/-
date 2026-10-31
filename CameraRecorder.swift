@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import Combine
 import UIKit
+import SwiftUI
 
 /// 相机 + 录制。一路 AVCaptureSession 同时干三件事：
 /// 预览、录视频（含声音）、把音频吐给语音识别。
