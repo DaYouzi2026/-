@@ -1,0 +1,88 @@
+name: build-ios
+
+# 点 Actions 里的 Run workflow，或在网页上直接改文件触发
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v4
+
+      # 网页上传会把文件夹压平，所有 .swift 都落在仓库根目录了，
+      # 而 project.yml 里写的是 sources: Tidanci。这里在编译前把目录复原。
+      - name: 整理目录
+        run: |
+          set -e
+          mkdir -p Tidanci/Assets.xcassets/AppIcon.appiconset
+
+          cp -f ./*.swift Tidanci/
+          cp -f icon1024.png Tidanci/Assets.xcassets/AppIcon.appiconset/icon1024.png
+
+          printf '%s\n' \
+            '{' \
+            '  "info" : { "author" : "xcode", "version" : 1 }' \
+            '}' > Tidanci/Assets.xcassets/Contents.json
+
+          printf '%s\n' \
+            '{' \
+            '  "images" : [' \
+            '    {' \
+            '      "filename" : "icon1024.png",' \
+            '      "idiom" : "universal",' \
+            '      "platform" : "ios",' \
+            '      "size" : "1024x1024"' \
+            '    }' \
+            '  ],' \
+            '  "info" : { "author" : "xcode", "version" : 1 }' \
+            '}' > Tidanci/Assets.xcassets/AppIcon.appiconset/Contents.json
+
+          echo "--- 整理后的 Tidanci/ ---"
+          ls -la Tidanci
+          echo "--- 资源目录 ---"
+          find Tidanci/Assets.xcassets -type f
+
+      - name: 装 XcodeGen
+        run: |
+          brew install xcodegen || brew upgrade xcodegen
+          xcodegen --version
+
+      - name: 生成 Xcode 工程
+        run: xcodegen generate
+
+      - name: 编译（不签名）
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Tidanci.xcodeproj \
+            -target Tidanci \
+            -configuration Release \
+            -sdk iphoneos \
+            CONFIGURATION_BUILD_DIR="$PWD/out" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: 打包成 ipa
+        run: |
+          APP="out/Tidanci.app"
+          test -d "$APP" || { echo "没有产物，编译应该在前面就失败了"; ls -R out || true; exit 1; }
+          rm -rf Payload Tidanci.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry Tidanci.ipa Payload
+          ls -lh Tidanci.ipa
+
+      - name: 上传安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tidanci-ipa
+          path: Tidanci.ipa
+          if-no-files-found: error
