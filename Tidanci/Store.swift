@@ -17,6 +17,18 @@ struct Script: Identifiable, Codable, Equatable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return s.count > 44 ? String(s.prefix(44)) + "…" : s
     }
+
+    var charCount: Int {
+        content.filter { !$0.isWhitespace && !$0.isNewline }.count
+    }
+
+    var durationText: String { Estimate.text(charCount) }
+
+    var updatedText: String {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm"
+        return f.string(from: updatedAt)
+    }
 }
 
 struct WorkItem: Identifiable, Hashable {

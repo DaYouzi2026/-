@@ -9,43 +9,19 @@ on:
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     steps:
       - name: 取代码
         uses: actions/checkout@v4
 
-      # 网页上传会把文件夹压平，所有 .swift 都落在仓库根目录了，
-      # 而 project.yml 里写的是 sources: Tidanci。这里在编译前把目录复原。
-      - name: 整理目录
+      - name: 检查文件结构
         run: |
-          set -e
-          mkdir -p Tidanci/Assets.xcassets/AppIcon.appiconset
-
-          cp -f ./*.swift Tidanci/
-          cp -f icon1024.png Tidanci/Assets.xcassets/AppIcon.appiconset/icon1024.png
-
-          printf '%s\n' \
-            '{' \
-            '  "info" : { "author" : "xcode", "version" : 1 }' \
-            '}' > Tidanci/Assets.xcassets/Contents.json
-
-          printf '%s\n' \
-            '{' \
-            '  "images" : [' \
-            '    {' \
-            '      "filename" : "icon1024.png",' \
-            '      "idiom" : "universal",' \
-            '      "platform" : "ios",' \
-            '      "size" : "1024x1024"' \
-            '    }' \
-            '  ],' \
-            '  "info" : { "author" : "xcode", "version" : 1 }' \
-            '}' > Tidanci/Assets.xcassets/AppIcon.appiconset/Contents.json
-
-          echo "--- 整理后的 Tidanci/ ---"
+          echo "--- 仓库根目录 ---"
+          ls -la
+          echo "--- Tidanci/ ---"
           ls -la Tidanci
-          echo "--- 资源目录 ---"
+          echo "--- 资源 ---"
           find Tidanci/Assets.xcassets -type f
 
       - name: 装 XcodeGen
@@ -79,6 +55,7 @@ jobs:
           cp -R "$APP" Payload/
           zip -qry Tidanci.ipa Payload
           ls -lh Tidanci.ipa
+          echo "内核大小：" && du -sh Payload/Tidanci.app
 
       - name: 上传安装包
         uses: actions/upload-artifact@v4

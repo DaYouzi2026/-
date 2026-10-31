@@ -21,10 +21,15 @@ final class CameraRecorder: NSObject, ObservableObject {
 
     /// 只在 cfgQ 上读写，用来判断「下一次该切哪个镜头」，避免和 Published 打架
     private var frontFlag = true
+    private var quality: VideoQuality = .uhd
+    private var fps: Int = 30
 
     @Published private(set) var ready = false
     @Published private(set) var recording = false
+    /// 实际生效的画质，比如 "4K·30"
     @Published private(set) var presetText = "—"
+    /// 实际分辨率，比如 "3840×2160"
+    @Published private(set) var detailText = ""
     @Published private(set) var isFront = true
     @Published private(set) var recordingError = ""
 
@@ -47,7 +52,9 @@ final class CameraRecorder: NSObject, ObservableObject {
 
     // MARK: - 启停
 
-    func start(front: Bool) {
+    func start(front: Bool, quality: VideoQuality, fps: Int) {
+        self.quality = quality
+        self.fps = fps
         cfgQ.async {
             if self.session.inputs.isEmpty {
                 self.configure(front: front)
@@ -73,6 +80,19 @@ final class CameraRecorder: NSObject, ObservableObject {
             if self.movieOut.isRecording { return }
             let target = !self.frontFlag
             self.configure(front: target)
+        }
+    }
+
+    /// 不录的时候改画质，立刻生效
+    func updateFormat(quality: VideoQuality, fps: Int) {
+        self.quality = quality
+        self.fps = fps
+        cfgQ.async {
+            guard !self.movieOut.isRecording, let dev = self.videoIn?.device else { return }
+            self.session.beginConfiguration()
+            self.applyFormat(dev)
+            self.session.commitConfiguration()
+            self.publishActual(dev, front: self.frontFlag)
         }
     }
 
@@ -112,16 +132,7 @@ final class CameraRecorder: NSObject, ObservableObject {
             audioIn = ai
         }
 
-        // 能 4K 就 4K，不行退 1080，再不行 720
-        if session.canSetSessionPreset(.hd4K3840x2160) {
-            session.sessionPreset = .hd4K3840x2160
-        } else if session.canSetSessionPreset(.hd1920x1080) {
-            session.sessionPreset = .hd1920x1080
-        } else if session.canSetSessionPreset(.hd1280x720) {
-            session.sessionPreset = .hd1280x720
-        } else {
-            session.sessionPreset = .high
-        }
+        applyFormat(dev)
 
         if !hasOutput(movieOut), session.canAddOutput(movieOut) {
             session.addOutput(movieOut)
@@ -137,20 +148,88 @@ final class CameraRecorder: NSObject, ObservableObject {
             c.videoOrientation = .portrait
         }
 
-        // 预设是结构体不是枚举，用 rawValue 判断，别写 switch
-        let raw = session.sessionPreset.rawValue
+        publishActual(dev, front: front)
+    }
+
+    /// 先按「短边 + 帧率」在镜头支持的格式里挑一个，挑不到再退回系统预设
+    private func applyFormat(_ dev: AVCaptureDevice) {
+        if session.canSetSessionPreset(.inputPriority) {
+            session.sessionPreset = .inputPriority
+        }
+
+        if let f = bestFormat(dev, short: quality.shortSide, fps: fps) {
+            do {
+                try dev.lockForConfiguration()
+                dev.activeFormat = f
+                let dur = CMTime(value: 1, timescale: CMTimeScale(fps))
+                dev.activeVideoMinFrameDuration = dur
+                dev.activeVideoMaxFrameDuration = dur
+                dev.unlockForConfiguration()
+                return
+            } catch {
+                // 掉到下面的预设兜底
+            }
+        }
+
+        if quality == .uhd, session.canSetSessionPreset(.hd4K3840x2160) {
+            session.sessionPreset = .hd4K3840x2160
+        } else if quality != .hd, session.canSetSessionPreset(.hd1920x1080) {
+            session.sessionPreset = .hd1920x1080
+        } else if session.canSetSessionPreset(.hd1280x720) {
+            session.sessionPreset = .hd1280x720
+        } else {
+            session.sessionPreset = .high
+        }
+    }
+
+    private func bestFormat(_ dev: AVCaptureDevice, short: CGFloat, fps: Int) -> AVCaptureDevice.Format? {
+        var best: AVCaptureDevice.Format?
+        var bestScore = -Double.greatestFiniteMagnitude
+
+        for f in dev.formats {
+            let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+            let s = CGFloat(min(d.width, d.height))
+            let l = CGFloat(max(d.width, d.height))
+            guard s >= short - 60 else { continue }
+            guard s > 0 else { continue }
+            let ar = l / s
+            guard abs(ar - 16.0 / 9.0) < 0.06 else { continue }
+            let fpsOK = f.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= Double(fps) - 0.5 }
+            guard fpsOK else { continue }
+
+            var score = -Double(abs(s - short)) * 4.0
+            if abs(s - short) < 1 { score += 400 }
+            if f.isVideoHDRSupported { score += 1 }
+            if score > bestScore {
+                bestScore = score
+                best = f
+            }
+        }
+        return best
+    }
+
+    private func publishActual(_ dev: AVCaptureDevice, front: Bool) {
+        let d = CMVideoFormatDescriptionGetDimensions(dev.activeFormat.formatDescription)
+        let short = Int(min(d.width, d.height))
+        let long = Int(max(d.width, d.height))
+
         let label: String
-        if raw.contains("3840") {
+        if short >= 2000 {
             label = "4K"
-        } else if raw.contains("1920") {
+        } else if short >= 1000 {
             label = "1080P"
-        } else if raw.contains("1280") {
+        } else if short >= 700 {
             label = "720P"
         } else {
-            label = "自动"
+            label = "\(short)P"
         }
+
+        let secs = CMTimeGetSeconds(dev.activeVideoMinFrameDuration)
+        let rate = (secs.isFinite && secs > 0) ? Int((1.0 / secs).rounded()) : 30
+
         DispatchQueue.main.async {
-            self.presetText = label
+            self.presetText = "\(label)·\(rate)"
+            self.detailText = "\(long)×\(short)"
             self.isFront = front
         }
     }
@@ -165,7 +244,9 @@ final class CameraRecorder: NSObject, ObservableObject {
         if let d = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: pos) {
             return d
         }
-        let types: [AVCaptureDevice.DeviceType] = [.builtInWideAngleCamera, .builtInDualCamera, .builtInUltraWideCamera]
+        let types: [AVCaptureDevice.DeviceType] = [.builtInWideAngleCamera,
+                                                   .builtInDualCamera,
+                                                   .builtInUltraWideCamera]
         let ds = AVCaptureDevice.DiscoverySession(deviceTypes: types, mediaType: .video, position: pos)
         return ds.devices.first ?? AVCaptureDevice.default(for: .video)
     }
