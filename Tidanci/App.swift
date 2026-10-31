@@ -65,21 +65,24 @@ struct HomeView: View {
             ZStack(alignment: .bottomTrailing) {
                 T.bg.ignoresSafeArea()
 
-                ScrollView {
-                    VStack(spacing: 12) {
-                        header
-                        if list.isEmpty {
-                            EmptyState(icon: "text.badge.plus",
-                                       title: query.isEmpty ? "还没有台本" : "没搜到",
-                                       sub: query.isEmpty ? "点右下角新建，或用左边的粘贴键导一段现成的稿子"
-                                                          : "换个关键词试试")
-                        } else {
-                            ForEach(list) { s in card(s) }
+                VStack(spacing: 0) {
+                    header
+
+                    ScrollView {
+                        VStack(spacing: 12) {
+                            if list.isEmpty {
+                                EmptyState(icon: "text.badge.plus",
+                                           title: query.isEmpty ? "还没有台本" : "没搜到",
+                                           sub: query.isEmpty ? "点右下角新建，或用左边的粘贴键导一段现成的稿子"
+                                                              : "换个关键词试试")
+                            } else {
+                                ForEach(list) { s in card(s) }
+                            }
                         }
+                        .padding(.horizontal, 16)
+                        .padding(.top, 16)
+                        .padding(.bottom, 120)
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 8)
-                    .padding(.bottom, 120)
                 }
 
                 fab
@@ -109,25 +112,33 @@ struct HomeView: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
                 Text("台本")
-                    .font(.system(size: 28, weight: .bold))
-                    .foregroundColor(T.ink)
+                    .font(.system(size: 30, weight: .bold))
+                    .foregroundColor(.white)
                 Spacer()
                 Text("\(store.scripts.count) 篇 · \(totalText)")
-                    .font(.system(size: 12))
-                    .foregroundColor(T.sub)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(.white.opacity(0.78))
             }
             searchBar
         }
+        .padding(.horizontal, 18)
         .padding(.top, 6)
+        .padding(.bottom, 18)
+        .background(
+            T.grad
+                .ignoresSafeArea(edges: .top)
+        )
     }
 
     private var searchBar: some View {
         HStack(spacing: 8) {
             Image(systemName: "magnifyingglass")
                 .font(.system(size: 14, weight: .medium))
-                .foregroundColor(T.sub)
+                .foregroundColor(.white.opacity(0.8))
             TextField("搜索台本", text: $query)
                 .font(.system(size: 14))
+                .foregroundColor(.white)
+                .accentColor(.white)
                 .submitLabel(.search)
             if !query.isEmpty {
                 Button {
@@ -135,17 +146,17 @@ struct HomeView: View {
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 14))
-                        .foregroundColor(T.sub)
+                        .foregroundColor(.white.opacity(0.75))
                 }
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
-        .background(T.surface)
+        .background(Color.white.opacity(0.18))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(T.line, lineWidth: 1)
+                .stroke(Color.white.opacity(0.25), lineWidth: 1)
         )
     }
 

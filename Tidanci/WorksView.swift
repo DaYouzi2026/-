@@ -17,30 +17,30 @@ struct WorksView: View {
 
     var body: some View {
         NavigationStack {
-            ZStack(alignment: .top) {
+            ZStack(alignment: .bottomTrailing) {
                 T.bg.ignoresSafeArea()
 
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 14) {
-                        ScreenHeader(title: "作品",
-                                     sub: store.works.isEmpty ? "拍完自动出现在这里" : "\(store.works.count) 个 · \(totalText)")
-                            .padding(.top, 6)
+                VStack(spacing: 0) {
+                    header
 
-                        if store.works.isEmpty {
-                            EmptyState(icon: "video.slash",
-                                       title: "还没有拍过东西",
-                                       sub: "回到台本页，选一篇点「开拍」，录完就会存到这里")
-                        } else {
-                            grid
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 14) {
+                            if store.works.isEmpty {
+                                EmptyState(icon: "video.slash",
+                                           title: "还没有拍过东西",
+                                           sub: "回到台本页，选一篇点「开拍」，录完就会存到这里")
+                            } else {
+                                grid
+                            }
                         }
+                        .padding(.horizontal, 16)
+                        .padding(.top, 16)
+                        .padding(.bottom, 40)
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 40)
                 }
 
                 if let t = tip {
-                    Toast(text: t)
-                        .padding(.top, 6)
+                    Toast(text: t).padding(.top, 6)
                 }
             }
             .navigationBarHidden(true)
@@ -53,6 +53,25 @@ struct WorksView: View {
                     .environmentObject(store)
             }
         }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("作品")
+                .font(.system(size: 30, weight: .bold))
+                .foregroundColor(.white)
+            Text(store.works.isEmpty ? "拍完自动出现在这里" : "\(store.works.count) 个 · \(totalText)")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(.white.opacity(0.78))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 18)
+        .padding(.top, 6)
+        .padding(.bottom, 18)
+        .background(
+            T.grad
+                .ignoresSafeArea(edges: .top)
+        )
     }
 
     private var grid: some View {

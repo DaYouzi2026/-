@@ -26,27 +26,50 @@ struct SettingsView: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(spacing: 18) {
-                    ScreenHeader(title: "我的", sub: "设置只对这台手机生效")
-                        .padding(.top, 6)
+            ZStack(alignment: .top) {
+                T.bg.ignoresSafeArea()
 
-                    qualityCard
-                    promptCard
-                    recordCard
-                    aboutCard
+                VStack(spacing: 0) {
+                    header
+
+                    ScrollView {
+                        VStack(spacing: 18) {
+                            qualityCard
+                            promptCard
+                            recordCard
+                            aboutCard
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.top, 16)
+                        .padding(.bottom, 48)
+                    }
                 }
-                .padding(.horizontal, 16)
-                .padding(.bottom, 48)
-            }
-            .background(T.bg.ignoresSafeArea())
-            .navigationBarHidden(true)
-            .overlay(alignment: .top) {
+
                 if let t = toast {
-                    Toast(text: t).padding(.top, 8)
+                    Toast(text: t).padding(.top, 6)
                 }
             }
+            .navigationBarHidden(true)
         }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("我的")
+                .font(.system(size: 30, weight: .bold))
+                .foregroundColor(.white)
+            Text("设置只对这台手机生效")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(.white.opacity(0.78))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 18)
+        .padding(.top, 6)
+        .padding(.bottom, 18)
+        .background(
+            T.grad
+                .ignoresSafeArea(edges: .top)
+        )
     }
 
     // MARK: 画质

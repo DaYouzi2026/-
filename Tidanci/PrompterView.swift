@@ -105,6 +105,14 @@ struct PrompterView: View {
     @AppStorage(Pref.autoSave) private var autoSave = true
     @AppStorage(Pref.followOn) private var followOnStored = true
 
+    @AppStorage(Pref.beautyOn) private var beautyOn = false
+    @AppStorage(Pref.bSmooth) private var bSmooth = 0.36
+    @AppStorage(Pref.bWhiten) private var bWhiten = 0.26
+    @AppStorage(Pref.bRosy) private var bRosy = 0.14
+    @AppStorage(Pref.bSlim) private var bSlim = 0.0
+    @AppStorage(Pref.bEye) private var bEye = 0.0
+    @AppStorage(Pref.bPreset) private var bPreset = 1
+
     @State private var followOn = true
     @State private var autoScroll = false
     @State private var cameraOn = true
@@ -117,7 +125,9 @@ struct PrompterView: View {
     @State private var countTimer: Timer?
     @State private var countdownLeft = 0
     @State private var showSettings = false
+    @State private var showBeauty = false
     @State private var askQuit = false
+    @State private var ignoreBeautyChange = false
 
     var body: some View {
         GeometryReader { geo in
@@ -125,8 +135,15 @@ struct PrompterView: View {
                 Color.black
 
                 if cameraOn {
-                    CameraPreview(session: cam.session)
-                        .ignoresSafeArea()
+                    Group {
+                        if cam.mode == .beauty {
+                            FilterPreview()
+                        } else {
+                            CameraPreview(session: cam.session)
+                        }
+                    }
+                    .ignoresSafeArea()
+
                     LinearGradient(colors: [Color.black.opacity(0.60),
                                             Color.black.opacity(0.10),
                                             Color.black.opacity(0.10),
@@ -165,7 +182,15 @@ struct PrompterView: View {
         .onChange(of: engine.cursor) { c in scrollTo(c) }
         .onChange(of: qualityRaw) { _ in applyQuality() }
         .onChange(of: fpsSetting) { _ in applyQuality() }
+        .onChange(of: beautyOn) { v in switchMode(v) }
+        .onChange(of: bSmooth) { _ in pushBeauty() }
+        .onChange(of: bWhiten) { _ in pushBeauty() }
+        .onChange(of: bRosy) { _ in pushBeauty() }
+        .onChange(of: bSlim) { _ in pushBeauty() }
+        .onChange(of: bEye) { _ in pushBeauty() }
+        .onChange(of: bPreset) { _ in pushBeauty() }
         .sheet(isPresented: $showSettings) { settingsSheet }
+        .sheet(isPresented: $showBeauty) { BeautyPanel() }
         .confirmationDialog("正在录制，退出会丢掉这段视频",
                             isPresented: $askQuit,
                             titleVisibility: .visible) {
@@ -265,17 +290,18 @@ struct PrompterView: View {
                 chipButton("跟读", followOn) { toggleFollow() }
                 chipButton("匀速", autoScroll) { toggleAuto() }
                 chipButton(mirror ? "镜像开" : "镜像", mirror) { mirror.toggle() }
-                chipButton("A-") { fontSize = max(20, fontSize - 2) }
-                chipButton("A+") { fontSize = min(64, fontSize + 2) }
+                chipButton("重来") { restart() }
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, 20)
 
             HStack {
                 Button {
-                    showSettings = true
+                    showBeauty = true
                 } label: {
-                    RoundIconButton(icon: "slider.horizontal.3", size: 44)
+                    RoundIconButton(icon: "sparkles",
+                                    size: 44,
+                                    bg: beautyOn ? T.accent : T.overlay)
                 }
                 .pressable()
 
@@ -286,13 +312,13 @@ struct PrompterView: View {
                 Spacer()
 
                 Button {
-                    restart()
+                    showSettings = true
                 } label: {
-                    RoundIconButton(icon: "arrow.counterclockwise", size: 44)
+                    RoundIconButton(icon: "slider.horizontal.3", size: 44)
                 }
                 .pressable()
             }
-            .padding(.horizontal, 34)
+            .padding(.horizontal, 40)
         }
         .padding(.bottom, 22)
         .background(
@@ -419,6 +445,7 @@ struct PrompterView: View {
         followOn = followOnStored
         autoScroll = !followOn
         startTicker()
+        pushBeauty()
         UIApplication.shared.isIdleTimerDisabled = true
         if cameraOn { openCamera() }
         if followOn && !engine.prepared.isEmpty {
@@ -456,7 +483,10 @@ struct PrompterView: View {
             let q = VideoQuality(rawValue: qualityRaw) ?? .uhd
             cam.onAudio = { buf in speech.feed(buf) }
             cam.onFinish = { url in handleFinish(url) }
-            cam.start(front: true, quality: q, fps: fpsSetting)
+            cam.start(front: true,
+                      quality: q,
+                      fps: fpsSetting,
+                      mode: beautyOn ? .beauty : .native)
         }
     }
 
@@ -611,6 +641,33 @@ struct PrompterView: View {
         cam.updateFormat(quality: q, fps: fpsSetting)
     }
 
+    // MARK: - 美颜
+
+    private func pushBeauty() {
+        BeautyPipeline.shared.params = BeautyParams(smooth: bSmooth,
+                                                    whiten: bWhiten,
+                                                    rosy: bRosy,
+                                                    slim: bSlim,
+                                                    eye: bEye,
+                                                    preset: BeautyFilterPreset(rawValue: bPreset) ?? .natural)
+    }
+
+    private func switchMode(_ on: Bool) {
+        if ignoreBeautyChange {
+            ignoreBeautyChange = false
+            return
+        }
+        guard !cam.recording else {
+            ignoreBeautyChange = true
+            beautyOn = !on
+            showTip("录制中不能切模式，停了再切")
+            return
+        }
+        Haptics.tap()
+        cam.setMode(on ? .beauty : .native)
+        pushBeauty()
+    }
+
     private func tryClose() {
         if cam.recording {
             askQuit = true
@@ -640,5 +697,100 @@ enum Haptics {
         let g = UINotificationFeedbackGenerator()
         g.prepare()
         g.notificationOccurred(.success)
+    }
+}
+
+// MARK: - 美颜面板
+
+struct BeautyPanel: View {
+    @AppStorage(Pref.beautyOn) private var on = false
+    @AppStorage(Pref.bSmooth) private var smooth = 0.36
+    @AppStorage(Pref.bWhiten) private var whiten = 0.26
+    @AppStorage(Pref.bRosy) private var rosy = 0.14
+    @AppStorage(Pref.bSlim) private var slim = 0.0
+    @AppStorage(Pref.bEye) private var eye = 0.0
+    @AppStorage(Pref.bPreset) private var preset = 1
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Capsule()
+                .fill(T.line)
+                .frame(width: 38, height: 4)
+                .padding(.top, 10)
+
+            Picker("", selection: $on) {
+                Text("原相机").tag(false)
+                Text("经典美颜").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 18)
+
+            filterStrip
+
+            VStack(spacing: 10) {
+                bar("磨皮", $smooth)
+                bar("美白", $whiten)
+                bar("红润", $rosy)
+                bar("瘦脸", $slim)
+                bar("大眼", $eye)
+            }
+            .padding(.horizontal, 18)
+            .opacity(on ? 1 : 0.4)
+            .disabled(!on)
+
+            Text(on ? "美颜模式最高 1080P，要 4K 请切回原相机" : "美颜关着，拍的是原相机画面，可用 4K")
+                .font(.system(size: 10))
+                .foregroundColor(T.sub)
+                .padding(.bottom, 6)
+        }
+        .background(T.bg.ignoresSafeArea())
+        .presentationDetents([.height(540)])
+    }
+
+    private var filterStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 14) {
+                ForEach(BeautyFilterPreset.allCases) { p in
+                    Button {
+                        preset = p.rawValue
+                        Haptics.tap()
+                    } label: {
+                        VStack(spacing: 6) {
+                            Circle()
+                                .fill(Color(uiColor: p.swatch))
+                                .frame(width: 44, height: 44)
+                                .overlay(
+                                    Circle()
+                                        .stroke(preset == p.rawValue ? T.accent : Color.clear, lineWidth: 2.5)
+                                        .padding(-3)
+                                )
+                            Text(p.title)
+                                .font(.system(size: 10, weight: preset == p.rawValue ? .semibold : .regular))
+                                .foregroundColor(preset == p.rawValue ? T.ink : T.sub)
+                        }
+                    }
+                    .pressable()
+                }
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 2)
+        }
+        .opacity(on ? 1 : 0.4)
+        .disabled(!on)
+    }
+
+    private func bar(_ title: String, _ value: Binding<Double>) -> some View {
+        HStack(spacing: 10) {
+            Text(title)
+                .font(.system(size: 12))
+                .foregroundColor(T.ink2)
+                .frame(width: 30, alignment: .leading)
+            Slider(value: value, in: 0...1)
+                .tint(T.accent)
+            Text("\(Int(value.wrappedValue * 100))")
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundColor(T.accent)
+                .frame(width: 26, alignment: .trailing)
+        }
     }
 }

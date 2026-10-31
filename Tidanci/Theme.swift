@@ -70,6 +70,7 @@ struct CardModifier: ViewModifier {
                 RoundedRectangle(cornerRadius: radius, style: .continuous)
                     .stroke(T.line, lineWidth: 1)
             )
+            .shadow(color: Color.black.opacity(0.045), radius: 12, x: 0, y: 4)
     }
 }
 

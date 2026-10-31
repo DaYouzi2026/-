@@ -1,28 +1,58 @@
 import Foundation
 import AVFoundation
+import CoreVideo
 import Combine
 import UIKit
 import SwiftUI
+import ImageIO
 
-/// 相机 + 录制。一路 AVCaptureSession 同时干三件事：
-/// 预览、录视频（含声音）、把音频吐给语音识别。
-/// 所以边录边跟读不需要抢麦克风。
+/// 相机 + 录制。两条通路：
+///
+/// * 原相机（native）：AVCaptureMovieFileOutput 直接落盘，能 4K/60fps，画质最高。
+/// * 经典美颜（beauty）：AVCaptureVideoDataOutput → Core Image 美颜 → AVAssetWriter 落盘，
+///   预览走 AVSampleBufferDisplayLayer。这条路走 GPU，1080P 封顶。
+///
+/// 两条路共用一路音频：既喂语音识别，也喂录制。
 final class CameraRecorder: NSObject, ObservableObject {
+
+    enum Mode: String {
+        case native
+        case beauty
+
+        var title: String {
+            self == .native ? "原相机" : "经典美颜"
+        }
+    }
 
     let session = AVCaptureSession()
 
     private let movieOut = AVCaptureMovieFileOutput()
+    private let videoOut = AVCaptureVideoDataOutput()
     private let audioOut = AVCaptureAudioDataOutput()
+    private let writer = BeautyWriter()
+
     private var videoIn: AVCaptureDeviceInput?
     private var audioIn: AVCaptureDeviceInput?
 
     private let cfgQ = DispatchQueue(label: "tidanci.cam.config")
+    private let videoQ = DispatchQueue(label: "tidanci.cam.video")
     private let audioQ = DispatchQueue(label: "tidanci.cam.audio")
 
-    /// 只在 cfgQ 上读写，用来判断「下一次该切哪个镜头」，避免和 Published 打架
+    // 只在 cfgQ 上读写
     private var frontFlag = true
+    private var modeFlag: Mode = .native
     private var quality: VideoQuality = .uhd
-    private var fps: Int = 30
+    private var fps = 30
+    private var needRotate = false
+
+    // 只在 videoQ 上读写
+    private var recordingFlag = false
+    private var pendingURL: URL?
+    private var writerReady = false
+    private var previewPool: CVPixelBufferPool?
+    private var previewDims = CGSize.zero
+    private var audioRate: Double = 44100
+    private var audioChannels = 1
 
     @Published private(set) var ready = false
     @Published private(set) var recording = false
@@ -31,6 +61,7 @@ final class CameraRecorder: NSObject, ObservableObject {
     /// 实际分辨率，比如 "3840×2160"
     @Published private(set) var detailText = ""
     @Published private(set) var isFront = true
+    @Published private(set) var mode: Mode = .native
     @Published private(set) var recordingError = ""
 
     var onAudio: ((AVAudioPCMBuffer) -> Void)?
@@ -52,9 +83,10 @@ final class CameraRecorder: NSObject, ObservableObject {
 
     // MARK: - 启停
 
-    func start(front: Bool, quality: VideoQuality, fps: Int) {
+    func start(front: Bool, quality: VideoQuality, fps: Int, mode: Mode) {
         self.quality = quality
         self.fps = fps
+        self.modeFlag = mode
         cfgQ.async {
             if self.session.inputs.isEmpty {
                 self.configure(front: front)
@@ -62,7 +94,10 @@ final class CameraRecorder: NSObject, ObservableObject {
             if !self.session.isRunning {
                 self.session.startRunning()
             }
-            DispatchQueue.main.async { self.ready = true }
+            DispatchQueue.main.async {
+                self.ready = true
+                self.mode = mode
+            }
         }
     }
 
@@ -83,7 +118,31 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
     }
 
-    /// 不录的时候改画质，立刻生效
+    /// 切原相机 / 美颜。会重配输出，画面会闪一下，所以只在没录的时候调。
+    func setMode(_ m: Mode) {
+        cfgQ.async {
+            guard self.modeFlag != m else { return }
+            guard !self.movieOut.isRecording else { return }
+            self.modeFlag = m
+            self.session.beginConfiguration()
+            self.configureOutputs()
+            if let dev = self.videoIn?.device {
+                self.applyFormat(dev)
+            }
+            self.session.commitConfiguration()
+            self.videoQ.async {
+                self.previewPool = nil
+                self.previewDims = .zero
+            }
+            DispatchQueue.main.async {
+                self.mode = m
+                if let dev = self.videoIn?.device {
+                    self.publishActual(dev, front: self.frontFlag)
+                }
+            }
+        }
+    }
+
     func updateFormat(quality: VideoQuality, fps: Int) {
         self.quality = quality
         self.fps = fps
@@ -133,35 +192,60 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
 
         applyFormat(dev)
-
-        if !hasOutput(movieOut), session.canAddOutput(movieOut) {
-            session.addOutput(movieOut)
-            movieOut.movieFragmentInterval = CMTime(seconds: 10, preferredTimescale: 600)
-        }
-
-        if !hasOutput(audioOut), session.canAddOutput(audioOut) {
-            audioOut.setSampleBufferDelegate(self, queue: audioQ)
-            session.addOutput(audioOut)
-        }
-
-        if let c = movieOut.connection(with: .video), c.isVideoOrientationSupported {
-            c.videoOrientation = .portrait
-        }
-
+        configureOutputs()
         publishActual(dev, front: front)
     }
 
-    /// 先按「短边 + 帧率」在镜头支持的格式里挑一个，挑不到再退回系统预设
+    private func configureOutputs() {
+        for o in session.outputs {
+            session.removeOutput(o)
+        }
+
+        if modeFlag == .native {
+            if session.canAddOutput(movieOut) {
+                session.addOutput(movieOut)
+                movieOut.movieFragmentInterval = CMTime(seconds: 10, preferredTimescale: 600)
+            }
+            if let c = movieOut.connection(with: .video), c.isVideoOrientationSupported {
+                c.videoOrientation = .portrait
+            }
+        } else {
+            videoOut.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)]
+            videoOut.alwaysDiscardsLateVideoFrames = true
+            videoOut.setSampleBufferDelegate(self, queue: videoQ)
+            if session.canAddOutput(videoOut) {
+                session.addOutput(videoOut)
+            }
+            if let c = videoOut.connection(with: .video) {
+                if c.isVideoOrientationSupported {
+                    c.videoOrientation = .portrait
+                    needRotate = false
+                } else {
+                    needRotate = true
+                }
+            }
+        }
+
+        audioOut.setSampleBufferDelegate(self, queue: audioQ)
+        if session.canAddOutput(audioOut) {
+            session.addOutput(audioOut)
+        }
+    }
+
     private func applyFormat(_ dev: AVCaptureDevice) {
+        // 美颜要逐帧过 GPU，1080P/30 是稳的上限；要 4K 就切原相机
+        let side = modeFlag == .beauty ? min(quality.shortSide, 1080) : quality.shortSide
+        let targetFps = modeFlag == .beauty ? min(fps, 30) : fps
+
         if session.canSetSessionPreset(.inputPriority) {
             session.sessionPreset = .inputPriority
         }
 
-        if let f = bestFormat(dev, short: quality.shortSide, fps: fps) {
+        if let f = bestFormat(dev, short: side, fps: targetFps) {
             do {
                 try dev.lockForConfiguration()
                 dev.activeFormat = f
-                let dur = CMTime(value: 1, timescale: CMTimeScale(fps))
+                let dur = CMTime(value: 1, timescale: CMTimeScale(targetFps))
                 dev.activeVideoMinFrameDuration = dur
                 dev.activeVideoMaxFrameDuration = dur
                 dev.unlockForConfiguration()
@@ -171,9 +255,9 @@ final class CameraRecorder: NSObject, ObservableObject {
             }
         }
 
-        if quality == .uhd, session.canSetSessionPreset(.hd4K3840x2160) {
+        if side >= 2000, session.canSetSessionPreset(.hd4K3840x2160) {
             session.sessionPreset = .hd4K3840x2160
-        } else if quality != .hd, session.canSetSessionPreset(.hd1920x1080) {
+        } else if side >= 1000, session.canSetSessionPreset(.hd1920x1080) {
             session.sessionPreset = .hd1920x1080
         } else if session.canSetSessionPreset(.hd1280x720) {
             session.sessionPreset = .hd1280x720
@@ -199,7 +283,6 @@ final class CameraRecorder: NSObject, ObservableObject {
 
             var score = -Double(abs(s - short)) * 4.0
             if abs(s - short) < 1 { score += 400 }
-            if f.isVideoHDRSupported { score += 1 }
             if score > bestScore {
                 bestScore = score
                 best = f
@@ -234,11 +317,6 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
     }
 
-    private func hasOutput(_ o: AVCaptureOutput) -> Bool {
-        for x in session.outputs where x === o { return true }
-        return false
-    }
-
     private func camera(front: Bool) -> AVCaptureDevice? {
         let pos: AVCaptureDevice.Position = front ? .front : .back
         if let d = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: pos) {
@@ -254,30 +332,177 @@ final class CameraRecorder: NSObject, ObservableObject {
     // MARK: - 录制
 
     func startRecording(to url: URL) {
-        cfgQ.async {
-            guard self.movieOut.isRecording == false else { return }
-            if let c = self.movieOut.connection(with: .video), c.isVideoOrientationSupported {
-                c.videoOrientation = .portrait
+        if modeFlag == .native {
+            cfgQ.async {
+                guard self.movieOut.isRecording == false else { return }
+                if let c = self.movieOut.connection(with: .video), c.isVideoOrientationSupported {
+                    c.videoOrientation = .portrait
+                }
+                try? FileManager.default.removeItem(at: url)
+                DispatchQueue.main.async {
+                    self.recordingError = ""
+                    self.recording = true
+                }
+                self.movieOut.startRecording(to: url, recordingDelegate: self)
             }
-            try? FileManager.default.removeItem(at: url)
+            return
+        }
+
+        videoQ.async {
+            self.pendingURL = url
+            self.writerReady = false
+            self.recordingFlag = true
             DispatchQueue.main.async {
                 self.recordingError = ""
                 self.recording = true
             }
-            self.movieOut.startRecording(to: url, recordingDelegate: self)
         }
     }
 
     func stopRecording() {
-        cfgQ.async {
-            if self.movieOut.isRecording {
-                self.movieOut.stopRecording()
+        if modeFlag == .native {
+            cfgQ.async {
+                if self.movieOut.isRecording {
+                    self.movieOut.stopRecording()
+                }
             }
+            return
+        }
+
+        videoQ.async {
+            guard self.recordingFlag else { return }
+            self.recordingFlag = false
+            DispatchQueue.main.async { self.recording = false }
+            self.writer.finish { url in
+                self.onFinish?(url)
+            }
+        }
+    }
+
+    // MARK: - 美颜帧处理
+
+    private func handleVideo(_ sb: CMSampleBuffer) {
+        guard let px = CMSampleBufferGetImageBuffer(sb) else { return }
+        let pts = CMSampleBufferGetPresentationTimeStamp(sb)
+        let w = CVPixelBufferGetWidth(px)
+        let h = CVPixelBufferGetHeight(px)
+
+        var dims = CGSize(width: w, height: h)
+        var img = BeautyPipeline.shared.makeBuffer(px)
+        if needRotate {
+            img = img.oriented(.right)
+            dims = CGSize(width: h, height: w)
+        }
+        let out = BeautyPipeline.shared.process(img, dims: dims)
+
+        if let buf = previewBuffer(dims) {
+            BeautyPipeline.shared.render(out, into: buf)
+            PreviewSink.shared.push(buf, pts: pts)
+        }
+
+        guard recordingFlag else { return }
+        writeFrame(out, pts: pts, dims: dims)
+    }
+
+    private func writeFrame(_ img: CIImage, pts: CMTime, dims: CGSize) {
+        if !writerReady {
+            guard let url = pendingURL else { return }
+            writerReady = writer.begin(url: url,
+                                       width: Int(dims.width),
+                                       height: Int(dims.height),
+                                       sampleRate: audioRate,
+                                       channels: audioChannels)
+            if !writerReady {
+                recordingFlag = false
+                DispatchQueue.main.async {
+                    self.recording = false
+                    self.recordingError = "编码器起不来，切回原相机模式再试"
+                    self.onFinish?(nil)
+                }
+                return
+            }
+        }
+
+        guard let pool = writer.pool else { return }
+        var pb: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pb) == kCVReturnSuccess,
+              let buf = pb else { return }
+        BeautyPipeline.shared.render(img, into: buf)
+        writer.append(video: buf, at: pts)
+    }
+
+    private func previewBuffer(_ dims: CGSize) -> CVPixelBuffer? {
+        if previewPool == nil || previewDims != dims {
+            let attrs: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+                kCVPixelBufferWidthKey as String: Int(dims.width),
+                kCVPixelBufferHeightKey as String: Int(dims.height),
+                kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any]()
+            ]
+            var pool: CVPixelBufferPool?
+            CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attrs as CFDictionary, &pool)
+            previewPool = pool
+            previewDims = dims
+        }
+        guard let pool = previewPool else { return nil }
+        var pb: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pb) == kCVReturnSuccess else {
+            return nil
+        }
+        return pb
+    }
+
+    private func handleAudio(_ sb: CMSampleBuffer) {
+        if let fd = CMSampleBufferGetFormatDescription(sb),
+           let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd) {
+            let rate = asbd.pointee.mSampleRate
+            let ch = Int(asbd.pointee.mChannelsPerFrame)
+            if rate > 8000, ch > 0 {
+                audioRate = rate
+                audioChannels = ch
+            }
+        }
+
+        if recordingFlag, modeFlag == .beauty {
+            writer.append(audio: sb)
+        }
+
+        if let pcm = CameraRecorder.toPCM(sb) {
+            onAudio?(pcm)
+        }
+    }
+
+    static func toPCM(_ sb: CMSampleBuffer) -> AVAudioPCMBuffer? {
+        guard let fd = CMSampleBufferGetFormatDescription(sb),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd) else { return nil }
+        let frames = CMSampleBufferGetNumSamples(sb)
+        guard frames > 0 else { return nil }
+        guard let fmt = AVAudioFormat(streamDescription: asbd),
+              let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(frames)) else { return nil }
+        buf.frameLength = AVAudioFrameCount(frames)
+        let st = CMSampleBufferCopyPCMDataIntoAudioBufferList(sb, at: 0,
+                                                             frameCount: Int32(frames),
+                                                             into: buf.mutableAudioBufferList)
+        return st == noErr ? buf : nil
+    }
+}
+
+// MARK: - 采集回调
+
+extension CameraRecorder: AVCaptureVideoDataOutputSampleBufferDelegate,
+                         AVCaptureAudioDataOutputSampleBufferDelegate {
+    func captureOutput(_ output: AVCaptureOutput,
+                       didOutput sampleBuffer: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+        if output === videoOut {
+            handleVideo(sampleBuffer)
+        } else {
+            handleAudio(sampleBuffer)
         }
     }
 }
 
-// MARK: - 录制回调
+// MARK: - 原相机录制回调
 
 extension CameraRecorder: AVCaptureFileOutputRecordingDelegate {
     func fileOutput(_ output: AVCaptureFileOutput,
@@ -302,32 +527,7 @@ extension CameraRecorder: AVCaptureFileOutputRecordingDelegate {
     }
 }
 
-// MARK: - 音频回调（喂给语音识别）
-
-extension CameraRecorder: AVCaptureAudioDataOutputSampleBufferDelegate {
-    func captureOutput(_ output: AVCaptureOutput,
-                       didOutput sampleBuffer: CMSampleBuffer,
-                       from connection: AVCaptureConnection) {
-        guard let pcm = CameraRecorder.toPCM(sampleBuffer) else { return }
-        onAudio?(pcm)
-    }
-
-    static func toPCM(_ sb: CMSampleBuffer) -> AVAudioPCMBuffer? {
-        guard let fd = CMSampleBufferGetFormatDescription(sb),
-              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd) else { return nil }
-        let frames = CMSampleBufferGetNumSamples(sb)
-        guard frames > 0 else { return nil }
-        guard let fmt = AVAudioFormat(streamDescription: asbd),
-              let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(frames)) else { return nil }
-        buf.frameLength = AVAudioFrameCount(frames)
-        let st = CMSampleBufferCopyPCMDataIntoAudioBufferList(sb, at: 0,
-                                                             frameCount: Int32(frames),
-                                                             into: buf.mutableAudioBufferList)
-        return st == noErr ? buf : nil
-    }
-}
-
-// MARK: - 预览
+// MARK: - 原相机预览
 
 final class PreviewLayerView: UIView {
     override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }

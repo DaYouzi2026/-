@@ -13,6 +13,15 @@ enum Pref {
     static let autoSave = "p.autoSave"
     static let followOn = "p.followOn"
     static let dimRead = "p.dimRead"
+
+    // 美颜
+    static let beautyOn = "b.on"
+    static let bSmooth = "b.smooth"
+    static let bWhiten = "b.whiten"
+    static let bRosy = "b.rosy"
+    static let bSlim = "b.slim"
+    static let bEye = "b.eye"
+    static let bPreset = "b.preset"
 }
 
 /// 拍摄画质。短边决定档位，实际能不能上到 4K60 由镜头决定。
