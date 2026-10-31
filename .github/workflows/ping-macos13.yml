@@ -1,0 +1,9 @@
+name: ping-macos-13
+on:
+  workflow_dispatch:
+
+jobs:
+  hi:
+    runs-on: macos-13
+    steps:
+      - run: sw_vers; xcodebuild -version
