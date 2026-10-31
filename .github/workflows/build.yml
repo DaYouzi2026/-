@@ -1,0 +1,55 @@
+name: build-ios
+
+# 点 Actions 里的 Run workflow，或在网页上直接改文件触发
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v4
+
+      - name: 装 XcodeGen
+        run: |
+          brew install xcodegen || brew upgrade xcodegen
+          xcodegen --version
+
+      - name: 生成 Xcode 工程
+        run: xcodegen generate
+
+      - name: 编译（不签名）
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Tidanci.xcodeproj \
+            -target Tidanci \
+            -configuration Release \
+            -sdk iphoneos \
+            CONFIGURATION_BUILD_DIR="$PWD/out" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: 打包成 ipa
+        run: |
+          APP="out/Tidanci.app"
+          test -d "$APP" || { echo "没有产物，编译应该在前面就失败了"; ls -R out || true; exit 1; }
+          rm -rf Payload Tidanci.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry Tidanci.ipa Payload
+          ls -lh Tidanci.ipa
+
+      - name: 上传安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tidanci-ipa
+          path: Tidanci.ipa
+          if-no-files-found: error
