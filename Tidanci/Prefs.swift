@@ -14,6 +14,14 @@ enum Pref {
     static let followOn = "p.followOn"
     static let dimRead = "p.dimRead"
 
+    // 提词框
+    static let boxX = "p.box.x"
+    static let boxY = "p.box.y"
+    static let boxW = "p.box.w"
+    static let boxH = "p.box.h"
+    static let boxBorder = "p.box.border"
+    static let boxFocus = "p.box.focus"
+
     // 美颜
     static let beautyOn = "b.on"
     static let bSmooth = "b.smooth"

@@ -2,24 +2,21 @@ import SwiftUI
 import AVFoundation
 import UIKit
 
-enum ScriptMetrics {
-    /// 视线焦点落在屏幕高度的这个位置
-    static let focusY: CGFloat = 0.26
-
-    static func topInset(_ h: CGFloat) -> CGFloat { max(120, h * focusY) }
-    static func bottomInset(_ h: CGFloat) -> CGFloat { max(180, h * 0.46) }
-}
-
 // MARK: - 提词文字层
 
+/// 框内滚动的文字。真正的裁剪由外层 PrompterBox 负责，这里只管排版和滚动。
 struct ScriptTextView: UIViewRepresentable {
+    /// 当前朗读行落在框内的位置（0=顶，1=底）
+    static let focus: CGFloat = 0.40
+
     let prepared: PreparedScript
     let readEnd: Int
     let fontSize: CGFloat
     let lineGap: CGFloat
     let mirror: Bool
-    let viewHeight: CGFloat
+    let boxHeight: CGFloat
     let onReady: (UITextView) -> Void
+    let onResize: (UITextView) -> Void
 
     func makeUIView(context: Context) -> UITextView {
         let tv = UITextView()
@@ -28,13 +25,14 @@ struct ScriptTextView: UIViewRepresentable {
         tv.isSelectable = false
         tv.showsVerticalScrollIndicator = false
         tv.alwaysBounceVertical = true
-        tv.textContainerInset = UIEdgeInsets(top: 0, left: 24, bottom: 0, right: 24)
-        let top = ScriptMetrics.topInset(viewHeight)
-        tv.contentInset = UIEdgeInsets(top: top,
-                                       left: 0,
-                                       bottom: ScriptMetrics.bottomInset(viewHeight),
-                                       right: 0)
+        tv.textContainerInset = UIEdgeInsets(top: 0, left: 18, bottom: 0, right: 18)
+
+        let h = max(boxHeight, 90)
+        let top = h * ScriptTextView.focus
+        tv.contentInset = UIEdgeInsets(top: top, left: 0, bottom: h - top, right: 0)
         tv.contentOffset = CGPoint(x: 0, y: -top)
+
+        context.coordinator.lastHeight = h
         // 别在视图更新过程中改 State，延到下一个 runloop
         DispatchQueue.main.async { onReady(tv) }
         return tv
@@ -42,6 +40,7 @@ struct ScriptTextView: UIViewRepresentable {
 
     func updateUIView(_ tv: UITextView, context: Context) {
         context.coordinator.parent = self
+        context.coordinator.syncInset(tv)
         context.coordinator.apply(tv)
         tv.transform = mirror ? CGAffineTransform(scaleX: -1, y: 1) : .identity
     }
@@ -50,9 +49,24 @@ struct ScriptTextView: UIViewRepresentable {
 
     final class Coordinator {
         var parent: ScriptTextView
+        var lastHeight: CGFloat = 0
         private var lastKey = ""
 
         init(_ p: ScriptTextView) { parent = p }
+
+        /// 框被拖动改大改小时，内边距要跟着变，否则焦点线会跑偏
+        func syncInset(_ tv: UITextView) {
+            let h = max(parent.boxHeight, 90)
+            guard abs(h - lastHeight) > 1.5 else { return }
+            let oldTop = tv.contentInset.top
+            let top = h * ScriptTextView.focus
+            tv.contentInset = UIEdgeInsets(top: top, left: 0, bottom: h - top, right: 0)
+            // 补偿位移，拖动过程中文字不会乱跳
+            tv.contentOffset = CGPoint(x: 0, y: tv.contentOffset.y + (top - oldTop))
+            lastHeight = h
+            let cb = parent.onResize
+            DispatchQueue.main.async { cb(tv) }
+        }
 
         func apply(_ tv: UITextView) {
             let key = "\(parent.prepared.text.count)|\(parent.readEnd)|\(Int(parent.fontSize))|\(Int(parent.lineGap * 100))"
@@ -73,7 +87,7 @@ struct ScriptTextView: UIViewRepresentable {
             let end = max(0, min(parent.readEnd, total))
             if end > 0 {
                 s.addAttribute(.foregroundColor,
-                               value: UIColor.white.withAlphaComponent(0.24),
+                               value: UIColor.white.withAlphaComponent(0.28),
                                range: NSRange(location: 0, length: end))
             }
             let off = tv.contentOffset
@@ -113,6 +127,15 @@ struct PrompterView: View {
     @AppStorage(Pref.bEye) private var bEye = 0.0
     @AppStorage(Pref.bPreset) private var bPreset = 1
 
+    // 提词框：布局用 State（拖动时高频变化），落地值用 AppStorage（拖动结束才写）
+    @State private var boxLayout = BoxLayout.standard
+    @AppStorage(Pref.boxX) private var savedX = 0.07
+    @AppStorage(Pref.boxY) private var savedY = 0.15
+    @AppStorage(Pref.boxW) private var savedW = 0.86
+    @AppStorage(Pref.boxH) private var savedH = 0.295
+    @AppStorage(Pref.boxBorder) private var boxBorder = true
+    @AppStorage(Pref.boxFocus) private var boxFocus = true
+
     @State private var followOn = true
     @State private var autoScroll = false
     @State private var cameraOn = true
@@ -131,50 +154,42 @@ struct PrompterView: View {
 
     var body: some View {
         GeometryReader { geo in
+            let canvas = CGSize(width: geo.size.width, height: geo.size.height)
+
             ZStack {
                 Color.black
+                cameraLayer
+                vignette
 
-                if cameraOn {
-                    Group {
-                        if cam.mode == .beauty {
-                            FilterPreview()
-                        } else {
-                            CameraPreview(session: cam.session)
-                        }
-                    }
-                    .ignoresSafeArea()
-
-                    LinearGradient(colors: [Color.black.opacity(0.60),
-                                            Color.black.opacity(0.10),
-                                            Color.black.opacity(0.10),
-                                            Color.black.opacity(0.72)],
-                                   startPoint: .top,
-                                   endPoint: .bottom)
-                        .ignoresSafeArea()
-                        .allowsHitTesting(false)
+                PrompterBox(layout: $boxLayout,
+                            canvas: canvas,
+                            bordered: boxBorder,
+                            focusLine: boxFocus,
+                            onCommit: saveBox) { size in
+                    ScriptTextView(prepared: engine.prepared,
+                                   readEnd: engine.readEnd,
+                                   fontSize: CGFloat(fontSize),
+                                   lineGap: CGFloat(lineGap),
+                                   mirror: mirror,
+                                   boxHeight: size.height,
+                                   onReady: { tv in textView = tv },
+                                   onResize: { tv in
+                                       textView = tv
+                                       scrollTo(engine.cursor)
+                                   })
                 }
-
-                ScriptTextView(prepared: engine.prepared,
-                               readEnd: engine.readEnd,
-                               fontSize: CGFloat(fontSize),
-                               lineGap: CGFloat(lineGap),
-                               mirror: mirror,
-                               viewHeight: geo.size.height,
-                               onReady: { tv in textView = tv })
 
                 VStack(spacing: 0) {
                     topBar
                     Spacer(minLength: 0)
                     if let t = tip {
                         Toast(text: t)
-                            .padding(.bottom, 10)
+                            .padding(.bottom, 12)
                     }
                     bottomPanel
                 }
             }
-            .overlay {
-                countdownOverlay
-            }
+            .overlay { countdownOverlay }
         }
         .statusBarHidden(true)
         .onAppear(perform: boot)
@@ -202,6 +217,33 @@ struct PrompterView: View {
         }
     }
 
+    // MARK: 画面
+
+    @ViewBuilder
+    private var cameraLayer: some View {
+        if cameraOn {
+            Group {
+                if cam.mode == .beauty {
+                    FilterPreview()
+                } else {
+                    CameraPreview(session: cam.session)
+                }
+            }
+            .ignoresSafeArea()
+        }
+    }
+
+    private var vignette: some View {
+        LinearGradient(colors: [Color.black.opacity(0.55),
+                                Color.black.opacity(0.06),
+                                Color.black.opacity(0.06),
+                                Color.black.opacity(0.70)],
+                       startPoint: .top,
+                       endPoint: .bottom)
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
+    }
+
     // MARK: 顶部
 
     private var statusLine: String {
@@ -214,94 +256,113 @@ struct PrompterView: View {
     }
 
     private var topBar: some View {
-        HStack(spacing: 10) {
-            Button {
-                tryClose()
-            } label: {
-                RoundIconButton(icon: "xmark")
+        VStack(spacing: 9) {
+            HStack(spacing: 11) {
+                Button {
+                    tryClose()
+                } label: {
+                    RoundIconButton(icon: "xmark", size: 38, bg: Color.black.opacity(0.42))
+                }
+                .pressable()
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(script.displayTitle)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                    Text(statusLine)
+                        .font(.system(size: 11))
+                        .foregroundColor(.white.opacity(0.66))
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 6)
+
+                Text("\(engine.percent)%")
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.90))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(Color.black.opacity(0.42))
+                    .clipShape(Capsule())
+
+                Button {
+                    cam.switchCamera()
+                } label: {
+                    RoundIconButton(icon: "arrow.triangle.2.circlepath",
+                                    size: 38,
+                                    bg: Color.black.opacity(0.42))
+                        .opacity(cam.recording ? 0.35 : 1)
+                }
+                .disabled(cam.recording)
+                .pressable()
             }
-            .pressable()
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(script.displayTitle)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(.white)
-                    .lineLimit(1)
-                Text(statusLine)
-                    .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.70))
-                    .lineLimit(1)
-            }
-
-            Spacer(minLength: 6)
-
-            Text("\(engine.percent)%")
-                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                .foregroundColor(.white)
-                .padding(.horizontal, 9)
-                .padding(.vertical, 5)
-                .background(Color.black.opacity(0.45))
-                .clipShape(Capsule())
-
-            Button {
-                cam.switchCamera()
-            } label: {
-                RoundIconButton(icon: "arrow.triangle.2.circlepath")
-                    .opacity(cam.recording ? 0.4 : 1)
-            }
-            .disabled(cam.recording)
-            .pressable()
+            progressBar
         }
         .padding(.horizontal, 14)
-        .padding(.top, 6)
+        .padding(.top, 4)
+        .padding(.bottom, 10)
+        .background(
+            LinearGradient(colors: [Color.black.opacity(0.58), Color.black.opacity(0.0)],
+                           startPoint: .top,
+                           endPoint: .bottom)
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+        )
+    }
+
+    private var progressBar: some View {
+        GeometryReader { g in
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.white.opacity(0.16))
+                Capsule()
+                    .fill(LinearGradient(colors: [Color.white.opacity(0.95), Color(hex: 0xB6AEFF)],
+                                         startPoint: .leading,
+                                         endPoint: .trailing))
+                    .frame(width: max(5, g.size.width * CGFloat(engine.percent) / 100))
+            }
+        }
+        .frame(height: 3)
+        .padding(.horizontal, 4)
     }
 
     // MARK: 底部
 
     private var bottomPanel: some View {
-        VStack(spacing: 14) {
+        VStack(spacing: 12) {
             HStack(spacing: 8) {
-                Text(cam.presetText)
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.92))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Color.white.opacity(0.16))
-                    .clipShape(Capsule())
+                pill(cam.presetText, mono: true)
 
                 if cam.recording {
                     HStack(spacing: 5) {
-                        Circle().fill(T.danger).frame(width: 7, height: 7)
+                        Circle()
+                            .fill(T.danger)
+                            .frame(width: 7, height: 7)
                         Text(recSec.mmss)
                             .font(.system(size: 11, weight: .semibold, design: .monospaced))
                             .foregroundColor(.white)
                     }
                     .padding(.horizontal, 9)
-                    .padding(.vertical, 4)
-                    .background(Color.black.opacity(0.5))
+                    .padding(.vertical, 5)
+                    .background(Color.black.opacity(0.48))
                     .clipShape(Capsule())
                 }
 
-                Spacer()
-            }
-            .padding(.horizontal, 20)
-
-            HStack(spacing: 7) {
-                chipButton("跟读", followOn) { toggleFollow() }
-                chipButton("匀速", autoScroll) { toggleAuto() }
-                chipButton(mirror ? "镜像开" : "镜像", mirror) { mirror.toggle() }
-                chipButton("重来") { restart() }
                 Spacer(minLength: 0)
             }
-            .padding(.horizontal, 20)
+            .padding(.horizontal, 22)
+
+            toolBar
 
             HStack {
                 Button {
                     showBeauty = true
                 } label: {
                     RoundIconButton(icon: "sparkles",
-                                    size: 44,
-                                    bg: beautyOn ? T.accent : T.overlay)
+                                    size: 46,
+                                    bg: beautyOn ? T.accent : Color.black.opacity(0.44))
                 }
                 .pressable()
 
@@ -314,20 +375,75 @@ struct PrompterView: View {
                 Button {
                     showSettings = true
                 } label: {
-                    RoundIconButton(icon: "slider.horizontal.3", size: 44)
+                    RoundIconButton(icon: "slider.horizontal.3",
+                                    size: 46,
+                                    bg: Color.black.opacity(0.44))
                 }
                 .pressable()
             }
-            .padding(.horizontal, 40)
+            .padding(.horizontal, 38)
+            .padding(.top, 2)
         }
-        .padding(.bottom, 22)
+        .padding(.bottom, 20)
         .background(
-            LinearGradient(colors: [Color.black.opacity(0.0), Color.black.opacity(0.55)],
+            LinearGradient(colors: [Color.black.opacity(0.0), Color.black.opacity(0.62)],
                            startPoint: .top,
                            endPoint: .bottom)
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
         )
+    }
+
+    private var toolBar: some View {
+        HStack(spacing: 2) {
+            toolItem("waveform", "跟读", followOn) { toggleFollow() }
+            toolItem("arrow.down.to.line", "匀速", autoScroll) { toggleAuto() }
+            toolItem("arrow.left.arrow.right", "镜像", mirror) { mirror.toggle() }
+            toolItem("rectangle.dashed", "提词框", false) { showSettings = true }
+            toolItem("arrow.counterclockwise", "重来", false) { restart() }
+        }
+        .padding(4)
+        .background(Color.black.opacity(0.44))
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(Color.white.opacity(0.10), lineWidth: 1)
+        )
+        .padding(.horizontal, 16)
+    }
+
+    private func toolItem(_ icon: String,
+                          _ label: String,
+                          _ active: Bool,
+                          _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                Image(systemName: icon)
+                    .font(.system(size: 16, weight: .semibold))
+                    .frame(height: 18)
+                Text(label)
+                    .font(.system(size: 9.5, weight: .medium))
+                    .lineLimit(1)
+            }
+            .foregroundColor(active ? .white : Color.white.opacity(0.80))
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+            .background(active ? T.accent : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+        .pressable()
+    }
+
+    private func pill(_ text: String, mono: Bool = false) -> some View {
+        Text(text)
+            .font(.system(size: 10,
+                          weight: .semibold,
+                          design: mono ? .monospaced : .default))
+            .foregroundColor(.white.opacity(0.92))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(Color.black.opacity(0.48))
+            .clipShape(Capsule())
     }
 
     private var recordButton: some View {
@@ -346,13 +462,6 @@ struct PrompterView: View {
                     .frame(width: cam.recording ? 32 : 64, height: cam.recording ? 32 : 64)
             }
             .animation(.easeInOut(duration: 0.18), value: cam.recording)
-        }
-        .pressable()
-    }
-
-    private func chipButton(_ text: String, _ active: Bool = false, _ action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Chip(text: text, active: active)
         }
         .pressable()
     }
@@ -382,6 +491,8 @@ struct PrompterView: View {
 
             ScrollView {
                 VStack(spacing: 18) {
+                    boxSection
+
                     sheetSlider("字号", $fontSize, 20...60, 2, "\(Int(fontSize))")
                     sheetSlider("行距", $lineGap, 0.10...0.90, 0.04, String(format: "%.2f", lineGap))
                     sheetSlider("匀速速度", $speed, 12...100, 2, "\(Int(speed))")
@@ -412,10 +523,68 @@ struct PrompterView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .padding(18)
+                .padding(.bottom, 24)
             }
         }
         .background(T.bg.ignoresSafeArea())
-        .presentationDetents([.height(430)])
+        .presentationDetents([.height(560)])
+    }
+
+    private var boxSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("提词框")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(T.ink)
+                Spacer()
+                Text("可直接拖动")
+                    .font(.system(size: 11))
+                    .foregroundColor(T.sub)
+            }
+
+            HStack(spacing: 8) {
+                ForEach(BoxPreset.allCases) { p in
+                    Button {
+                        applyPreset(p)
+                    } label: {
+                        Text(p.title)
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(BoxPreset.nearest(boxLayout) == p ? .white : T.ink2)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 9)
+                            .background(BoxPreset.nearest(boxLayout) == p ? T.accent : T.surface2)
+                            .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+                    }
+                    .pressable()
+                }
+            }
+
+            Toggle(isOn: $boxBorder) {
+                Text("显示框体")
+                    .font(.system(size: 13))
+                    .foregroundColor(T.ink2)
+            }
+            .tint(T.accent)
+
+            Toggle(isOn: $boxFocus) {
+                Text("焦点线")
+                    .font(.system(size: 13))
+                    .foregroundColor(T.ink2)
+            }
+            .tint(T.accent)
+
+            Text("拖框顶部的白色把手移动，拖右下角圆点改大小。读完一行，它就停在焦点线上。")
+                .font(.system(size: 11))
+                .foregroundColor(T.sub)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14)
+        .background(T.surface)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(T.line, lineWidth: 1)
+        )
     }
 
     private func sheetSlider(_ title: String,
@@ -438,9 +607,30 @@ struct PrompterView: View {
         }
     }
 
+    // MARK: - 提词框
+
+    private func saveBox(_ l: BoxLayout) {
+        savedX = Double(l.x)
+        savedY = Double(l.y)
+        savedW = Double(l.w)
+        savedH = Double(l.h)
+    }
+
+    private func applyPreset(_ p: BoxPreset) {
+        Haptics.tap()
+        withAnimation(.easeOut(duration: 0.24)) {
+            boxLayout = p.layout
+        }
+        saveBox(p.layout)
+    }
+
     // MARK: - 生命周期
 
     private func boot() {
+        boxLayout = BoxLayout(x: CGFloat(savedX),
+                              y: CGFloat(savedY),
+                              w: CGFloat(savedW),
+                              h: CGFloat(savedH)).clamped()
         engine.reset(script.content)
         followOn = followOnStored
         autoScroll = !followOn
@@ -460,6 +650,7 @@ struct PrompterView: View {
         countTimer = nil
         speech.stop()
         UIApplication.shared.isIdleTimerDisabled = false
+        saveBox(boxLayout)
         if cam.recording {
             // 先收尾再关会话，否则文件可能没写完
             cam.stopRecording()
@@ -571,10 +762,11 @@ struct PrompterView: View {
         let gr = lm.glyphRange(forCharacterRange: NSRange(location: loc, length: 0),
                                actualCharacterRange: nil)
         let rect = lm.boundingRect(forGlyphRange: gr, in: tv.textContainer)
-        let tar = rect.origin.y + tv.textContainerInset.top - tv.bounds.height * ScriptMetrics.focusY
+        let focusY = tv.bounds.height * ScriptTextView.focus
+        let tar = rect.origin.y + tv.textContainerInset.top - focusY
         let maxY = max(0, tv.contentSize.height + tv.contentInset.bottom - tv.bounds.height)
         let y = min(max(tar, -tv.contentInset.top), maxY)
-        UIView.animate(withDuration: 0.4,
+        UIView.animate(withDuration: 0.32,
                        delay: 0,
                        options: [.curveEaseOut, .allowUserInteraction, .beginFromCurrentState]) {
             tv.contentOffset = CGPoint(x: 0, y: y)
