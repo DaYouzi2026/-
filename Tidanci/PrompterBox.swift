@@ -109,6 +109,15 @@ struct PrompterBox<Content: View>: View {
 
             content(CGSize(width: r.width, height: r.height))
                 .frame(width: r.width, height: r.height)
+                // 上下边缘渐隐，别让字被硬生生切掉
+                .mask(
+                    LinearGradient(stops: [
+                        .init(color: .clear, location: 0.0),
+                        .init(color: .white, location: 0.08),
+                        .init(color: .white, location: 0.90),
+                        .init(color: .clear, location: 1.0)
+                    ], startPoint: .top, endPoint: .bottom)
+                )
 
             if focusLine {
                 Rectangle()
@@ -140,40 +149,32 @@ struct PrompterBox<Content: View>: View {
     // MARK: 把手
 
     private var grip: some View {
-        Group {
-            if bordered {
-                Capsule()
-                    .fill(Color.white.opacity(0.62))
-                    .frame(width: 40, height: 4)
-                    .padding(.horizontal, 30)
-                    .padding(.vertical, 11)
-                    .contentShape(Rectangle())
-                    .offset(y: -22)
-                    .gesture(moveGesture)
-            }
-        }
+        Capsule()
+            .fill(Color.white.opacity(bordered ? 0.62 : 0.34))
+            .frame(width: 40, height: 4)
+            .padding(.horizontal, 30)
+            .padding(.vertical, 11)
+            .contentShape(Rectangle())
+            .offset(y: -22)
+            .gesture(moveGesture)
     }
 
     // MARK: 缩放手柄
 
     private var knob: some View {
-        Group {
-            if bordered {
-                ZStack {
-                    Circle()
-                        .fill(Color.white.opacity(0.18))
-                    Circle()
-                        .stroke(Color.white.opacity(0.50), lineWidth: 1)
-                    Image(systemName: "arrow.up.left.and.arrow.down.right")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundColor(Color.white.opacity(0.88))
-                }
-                .frame(width: 26, height: 26)
-                .contentShape(Circle())
-                .offset(x: 9, y: 9)
-                .gesture(resizeGesture)
-            }
+        ZStack {
+            Circle()
+                .fill(Color.white.opacity(bordered ? 0.18 : 0.10))
+            Circle()
+                .stroke(Color.white.opacity(bordered ? 0.50 : 0.28), lineWidth: 1)
+            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundColor(Color.white.opacity(bordered ? 0.88 : 0.55))
         }
+        .frame(width: 26, height: 26)
+        .contentShape(Circle())
+        .offset(x: 9, y: 9)
+        .gesture(resizeGesture)
     }
 
     // MARK: 手势
