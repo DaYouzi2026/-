@@ -943,9 +943,31 @@ struct BeautyPanel: View {
             filterStrip
 
             VStack(spacing: 10) {
+                HStack {
+                    Text("皮肤")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(T.sub)
+                    Spacer()
+                    Text("整幅画面柔化")
+                        .font(.system(size: 10))
+                        .foregroundColor(T.sub)
+                }
+
                 bar("磨皮", $smooth)
                 bar("美白", $whiten)
                 bar("红润", $rosy)
+
+                HStack {
+                    Text("轮廓")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(T.sub)
+                    Spacer()
+                    Text("固定区域 · 需正对镜头")
+                        .font(.system(size: 10))
+                        .foregroundColor(T.warn)
+                }
+                .padding(.top, 6)
+
                 bar("瘦脸", $slim)
                 bar("大眼", $eye)
             }
@@ -953,13 +975,21 @@ struct BeautyPanel: View {
             .opacity(on ? 1 : 0.4)
             .disabled(!on)
 
-            Text(on ? "美颜模式最高 1080P，要 4K 请切回原相机" : "美颜关着，拍的是原相机画面，可用 4K")
+            Text(noteText)
                 .font(.system(size: 10))
                 .foregroundColor(T.sub)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 22)
                 .padding(.bottom, 6)
         }
         .background(T.bg.ignoresSafeArea())
-        .presentationDetents([.height(540)])
+        .presentationDetents([.height(560)])
+    }
+
+    private var noteText: String {
+        if !on { return "美颜关着，拍的是原相机画面，可用 4K" }
+        return "磨皮和美白作用于整个画面，人和背景一起柔化。瘦脸大眼没有做人脸识别，是按画面固定区域算的，歪头或不在中间就对不上。美颜最高 1080P，要 4K 请切回原相机。"
     }
 
     private var filterStrip: some View {
