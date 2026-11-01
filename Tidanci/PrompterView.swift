@@ -118,6 +118,7 @@ struct PrompterView: View {
     @AppStorage(Pref.countdown) private var countdown = 3
     @AppStorage(Pref.autoSave) private var autoSave = true
     @AppStorage(Pref.followOn) private var followOnStored = true
+    @AppStorage(Pref.mirrorSave) private var mirrorSave = true
 
     @AppStorage(Pref.beautyOn) private var beautyOn = false
     @AppStorage(Pref.bSmooth) private var bSmooth = 0.36
@@ -197,6 +198,7 @@ struct PrompterView: View {
         .onChange(of: engine.cursor) { c in scrollTo(c) }
         .onChange(of: qualityRaw) { _ in applyQuality() }
         .onChange(of: fpsSetting) { _ in applyQuality() }
+        .onChange(of: mirrorSave) { v in cam.setMirrorSave(v) }
         .onChange(of: beautyOn) { v in switchMode(v) }
         .onChange(of: bSmooth) { _ in pushBeauty() }
         .onChange(of: bWhiten) { _ in pushBeauty() }
@@ -226,7 +228,7 @@ struct PrompterView: View {
                 if cam.mode == .beauty {
                     FilterPreview()
                 } else {
-                    CameraPreview(session: cam.session)
+                    CameraPreview(session: cam.session, mirrored: cam.isFront && mirrorSave)
                 }
             }
             .ignoresSafeArea()
@@ -521,6 +523,26 @@ struct PrompterView: View {
                             .foregroundColor(T.sub)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("画面")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(T.sub)
+
+                        Toggle(isOn: $mirrorSave) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("前置镜像保存")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(T.ink2)
+                                Text("成片和取景框同方向。关掉会存真实方向，自拍左右会反过来")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(T.sub)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                        .tint(T.accent)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .padding(18)
                 .padding(.bottom, 24)
@@ -674,6 +696,7 @@ struct PrompterView: View {
             let q = VideoQuality(rawValue: qualityRaw) ?? .uhd
             cam.onAudio = { buf in speech.feed(buf) }
             cam.onFinish = { url in handleFinish(url) }
+            cam.setMirrorSave(mirrorSave)
             cam.start(front: true,
                       quality: q,
                       fps: fpsSetting,

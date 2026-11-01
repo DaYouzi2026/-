@@ -44,6 +44,8 @@ final class CameraRecorder: NSObject, ObservableObject {
     private var quality: VideoQuality = .uhd
     private var fps = 30
     private var needRotate = false
+    /// 前置录制是否镜像。默认开：取景框是镜面，成片也镜面，两边才对得上
+    private var mirrorSaveFlag = true
 
     // 只在 videoQ 上读写
     private var recordingFlag = false
@@ -115,6 +117,30 @@ final class CameraRecorder: NSObject, ObservableObject {
             if self.movieOut.isRecording { return }
             let target = !self.frontFlag
             self.configure(front: target)
+        }
+    }
+
+    /// 前置镜头默认镜像保存。取景框显示的是镜面（和照镜子一样），
+    /// 如果成片不镜像，左右会反过来，脸和嘴看着就"歪"了。
+    func setMirrorSave(_ on: Bool) {
+        cfgQ.async {
+            self.mirrorSaveFlag = on
+            guard !self.movieOut.isRecording else { return }
+            self.applyMirror()
+        }
+    }
+
+    /// 把镜像设置同步到所有视频连接。后置永远不镜像。
+    private func applyMirror() {
+        let m = mirrorSaveFlag && frontFlag
+        let outs: [AVCaptureOutput] = [movieOut, videoOut]
+        for o in outs {
+            guard let c = o.connection(with: .video) else { continue }
+            guard c.isVideoMirroringSupported else { continue }
+            if c.automaticallyAdjustsVideoMirroring {
+                c.automaticallyAdjustsVideoMirroring = false
+            }
+            c.isVideoMirrored = m
         }
     }
 
@@ -230,6 +256,9 @@ final class CameraRecorder: NSObject, ObservableObject {
         if session.canAddOutput(audioOut) {
             session.addOutput(audioOut)
         }
+
+        // 输出刚加完，连接才存在，镜像要在这时候设
+        applyMirror()
     }
 
     private func applyFormat(_ dev: AVCaptureDevice) {
@@ -338,6 +367,8 @@ final class CameraRecorder: NSObject, ObservableObject {
                 if let c = self.movieOut.connection(with: .video), c.isVideoOrientationSupported {
                     c.videoOrientation = .portrait
                 }
+                // 录制开始前再确认一次镜像，避免切镜头后连接被重建
+                self.applyMirror()
                 try? FileManager.default.removeItem(at: url)
                 DispatchQueue.main.async {
                     self.recordingError = ""
@@ -532,16 +563,43 @@ extension CameraRecorder: AVCaptureFileOutputRecordingDelegate {
 final class PreviewLayerView: UIView {
     override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
     var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
+
+    var mirrored: Bool = true {
+        didSet { syncMirror() }
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        syncMirror()
+    }
+
+    /// 取景框必须和录制连接用同一套镜像设置，否则"看到的"和"录出来的"是反的
+    func syncMirror() {
+        guard let c = previewLayer.connection else { return }
+        if c.isVideoOrientationSupported {
+            c.videoOrientation = .portrait
+        }
+        if c.isVideoMirroringSupported {
+            if c.automaticallyAdjustsVideoMirroring {
+                c.automaticallyAdjustsVideoMirroring = false
+            }
+            if c.isVideoMirrored != mirrored {
+                c.isVideoMirrored = mirrored
+            }
+        }
+    }
 }
 
 struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
+    var mirrored: Bool = true
 
     func makeUIView(context: Context) -> PreviewLayerView {
         let v = PreviewLayerView()
         v.backgroundColor = .black
         v.previewLayer.session = session
         v.previewLayer.videoGravity = .resizeAspectFill
+        v.mirrored = mirrored
         return v
     }
 
@@ -549,8 +607,7 @@ struct CameraPreview: UIViewRepresentable {
         if uiView.previewLayer.session !== session {
             uiView.previewLayer.session = session
         }
-        if let c = uiView.previewLayer.connection, c.isVideoOrientationSupported {
-            c.videoOrientation = .portrait
-        }
+        uiView.mirrored = mirrored
+        uiView.syncMirror()
     }
 }

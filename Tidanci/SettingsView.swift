@@ -11,6 +11,7 @@ struct SettingsView: View {
     @AppStorage(Pref.countdown) private var countdown = 3
     @AppStorage(Pref.autoSave) private var autoSave = true
     @AppStorage(Pref.mirror) private var mirror = false
+    @AppStorage(Pref.mirrorSave) private var mirrorSave = true
     @AppStorage(Pref.followOn) private var followOn = true
 
     @State private var toast: String?
@@ -196,6 +197,21 @@ struct SettingsView: View {
                 }
                 Spacer()
                 Toggle("", isOn: $autoSave).labelsHidden().tint(T.accent)
+            }
+            .padding(16)
+
+            RowDivider()
+
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("前置镜像保存").font(.system(size: 13)).foregroundColor(T.ink2)
+                    Text("成片和取景框同方向。关掉后自拍会存真实方向，左右反过来")
+                        .font(.system(size: 11))
+                        .foregroundColor(T.sub)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                Toggle("", isOn: $mirrorSave).labelsHidden().tint(T.accent)
             }
             .padding(16)
 

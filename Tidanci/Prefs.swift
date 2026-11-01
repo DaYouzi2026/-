@@ -13,6 +13,8 @@ enum Pref {
     static let autoSave = "p.autoSave"
     static let followOn = "p.followOn"
     static let dimRead = "p.dimRead"
+    /// 前置镜头录制成镜像（与取景框一致）
+    static let mirrorSave = "p.mirrorSave"
 
     // 提词框
     static let boxX = "p.box.x"
