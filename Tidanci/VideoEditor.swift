@@ -53,6 +53,7 @@ final class VideoEditor: ObservableObject {
     func run(input: URL,
              denoise: Bool,
              subtitle: Bool,
+             cutSilence: Bool = false,
              completion: @escaping (URL?, String?) -> Void) {
         guard !running else { return }
         running = true
@@ -88,13 +89,27 @@ final class VideoEditor: ObservableObject {
                 }
             }
 
-            // 2) 字幕
+            // 2) 掐气口
+            var keeps: [CMTimeRange] = []
+            if cutSilence {
+                DispatchQueue.main.async {
+                    self.stage = .transcribe
+                    self.statusText = "找气口…"
+                    self.progress = 0.42
+                }
+                keeps = SilenceCut.plan(newAudio ?? input)
+                if keeps.isEmpty {
+                    notes.append("没找到明显气口，节奏按原样保留")
+                }
+            }
+
+            // 3) 字幕
             var cues: [SubtitleCue] = []
             if subtitle {
                 DispatchQueue.main.async {
                     self.stage = .transcribe
                     self.statusText = "识别字幕…"
-                    self.progress = 0.45
+                    self.progress = 0.48
                 }
                 do {
                     cues = try self.transcribe(newAudio ?? input)
@@ -103,7 +118,7 @@ final class VideoEditor: ObservableObject {
                 }
             }
 
-            // 3) 合成
+            // 4) 合成
             DispatchQueue.main.async {
                 self.stage = .render
                 self.statusText = "合成中…"
@@ -113,7 +128,8 @@ final class VideoEditor: ObservableObject {
                 let out = try self.compose(asset: asset,
                                            vTrack: vTrack,
                                            audio: newAudio,
-                                           cues: cues)
+                                           cues: cues,
+                                           keeps: keeps)
                 DispatchQueue.main.async {
                     self.stage = .done
                     self.progress = 1
@@ -308,26 +324,33 @@ final class VideoEditor: ObservableObject {
         var buf = ""
         var start: Double = 0
         var end: Double = 0
-        let stop: Set<Character> = ["。", "！", "？", "，", "；", ".", "!", "?", ",", ";"]
+        let stop: Set<Character> = ["。", "！", "？", "，", "；", "、", "：",
+                                   ".", "!", "?", ",", ";", ":"]
+
+        func flush() {
+            let txt = buf.trimmingCharacters(in: .whitespacesAndNewlines)
+            buf = ""
+            guard !txt.isEmpty else { return }
+            var s = start
+            // 和上一条接上，别让两条字幕在同一时刻叠着 —— 叠了就是「一坨字堆在屏幕上」
+            if let p = out.last, s < p.end { s = p.end + 0.02 }
+            let e = max(end + 0.18, s + 0.25)
+            out.append(SubtitleCue(start: s, end: e, text: txt))
+        }
 
         for seg in t.segments {
             if buf.isEmpty { start = seg.timestamp }
             buf += seg.substring
             end = seg.timestamp + seg.duration
 
-            let long = buf.count >= 16
+            // 一行大概 14 个字；有标点就断开，读起来才跟得上口播的节奏
+            let long = buf.count >= 14
             let broken = seg.substring.contains { stop.contains($0) }
             if long || broken {
-                let txt = buf.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !txt.isEmpty {
-                    out.append(SubtitleCue(start: start, end: end + 0.20, text: txt))
-                }
-                buf = ""
+                flush()
             }
         }
-        if !buf.isEmpty {
-            out.append(SubtitleCue(start: start, end: end + 0.20, text: buf))
-        }
+        flush()
         return out
     }
 
@@ -336,33 +359,58 @@ final class VideoEditor: ObservableObject {
     private func compose(asset: AVAsset,
                          vTrack: AVAssetTrack,
                          audio: URL?,
-                         cues: [SubtitleCue]) throws -> URL {
+                         cues: [SubtitleCue],
+                         keeps: [CMTimeRange]) throws -> URL {
         let comp = AVMutableComposition()
         let dur = asset.duration
         guard dur.seconds > 0 else { throw Fail(msg: "视频长度不对") }
+
+        // 没检测到气口 / 用户没开 → 整片一段
+        let full = CMTimeRange(start: .zero, duration: dur)
+        let plan = keeps.isEmpty ? [full] : keeps
+        let cutting = !keeps.isEmpty
+            && (keeps.count > 1 || abs(keeps[0].duration.seconds - dur.seconds) > 0.05)
 
         guard let vt = comp.addMutableTrack(withMediaType: .video,
                                             preferredTrackID: kCMPersistentTrackID_Invalid) else {
             throw Fail(msg: "建不了视频轨")
         }
-        try vt.insertTimeRange(CMTimeRange(start: .zero, duration: dur), of: vTrack, at: .zero)
         vt.preferredTransform = vTrack.preferredTransform
 
-        // 音频：有降噪结果就用降噪的，否则保留原声
+        // 按保留片段逐段拼接：气口就是这么被掐掉的
+        var cursor = CMTime.zero
+        for k in plan {
+            try vt.insertTimeRange(k, of: vTrack, at: cursor)
+            cursor = cursor + k.duration
+        }
+        let total = cursor
+        guard total.seconds > 0.2 else { throw Fail(msg: "剪完几乎没有内容了") }
+
+        // 音频：有降噪结果就用降噪的，否则保留原声；同样按片段拼，保持口型同步
         if let a = audio {
             let aAsset = AVURLAsset(url: a)
             if let src = aAsset.tracks(withMediaType: .audio).first,
                let at = comp.addMutableTrack(withMediaType: .audio,
                                              preferredTrackID: kCMPersistentTrackID_Invalid) {
-                let ad = min(aAsset.duration, dur)
-                try? at.insertTimeRange(CMTimeRange(start: .zero, duration: ad),
-                                        of: src,
-                                        at: .zero)
+                var c = CMTime.zero
+                for k in plan {
+                    let left = CMTimeSubtract(aAsset.duration, k.start)
+                    let ad = CMTimeMinimum(k.duration, left)
+                    if ad.seconds > 0.02 {
+                        try? at.insertTimeRange(CMTimeRange(start: k.start, duration: ad),
+                                                of: src, at: c)
+                    }
+                    c = c + k.duration
+                }
             }
         } else if let src = asset.tracks(withMediaType: .audio).first,
                   let at = comp.addMutableTrack(withMediaType: .audio,
                                                 preferredTrackID: kCMPersistentTrackID_Invalid) {
-            try? at.insertTimeRange(CMTimeRange(start: .zero, duration: dur), of: src, at: .zero)
+            var c = CMTime.zero
+            for k in plan {
+                try? at.insertTimeRange(k, of: src, at: c)
+                c = c + k.duration
+            }
         }
 
         // 画面实际尺寸（考虑旋转）
@@ -370,6 +418,9 @@ final class VideoEditor: ObservableObject {
         let natural = vTrack.naturalSize
         let rect = CGRect(origin: .zero, size: natural).applying(tr)
         let size = CGSize(width: abs(rect.width), height: abs(rect.height))
+
+        // 剪过之后时间轴变了，字幕要跟着往前挪，否则会整段落错位
+        let shown = cutting ? SilenceCut.remap(cues, keeps: plan) : cues
 
         let out = Self.temp("edit.mp4")
         try? FileManager.default.removeItem(at: out)
@@ -379,13 +430,13 @@ final class VideoEditor: ObservableObject {
         vc.frameDuration = CMTime(value: 1, timescale: 30)
 
         let inst = AVMutableVideoCompositionInstruction()
-        inst.timeRange = CMTimeRange(start: .zero, duration: dur)
+        inst.timeRange = CMTimeRange(start: .zero, duration: total)
         let li = AVMutableVideoCompositionLayerInstruction(assetTrack: vt)
         li.setTransform(tr, at: .zero)
         inst.layerInstructions = [li]
         vc.instructions = [inst]
 
-        if !cues.isEmpty {
+        if !shown.isEmpty {
             let parent = CALayer()
             parent.frame = CGRect(origin: .zero, size: size)
             parent.isGeometryFlipped = false
@@ -394,28 +445,32 @@ final class VideoEditor: ObservableObject {
             video.frame = parent.frame
             parent.addSublayer(video)
 
-            for c in cues {
+            for c in shown {
                 guard c.end > c.start else { continue }
-                let text = Self.subtitleImage(c.text, size: size)
+                let img = Self.subtitleImage(c.text, size: size)
                 let layer = CALayer()
-                layer.contents = text.cgImage
+                layer.contents = img.cgImage
                 layer.contentsGravity = .resize
-                // CA 坐标原点在左下，字幕要贴底部，所以 y 取小值
-                let h = text.size.height
-                layer.frame = CGRect(x: 0,
+                // CA 坐标原点在左下，字幕要贴底部，所以 y 取小值；水平居中，别横向拉伸
+                layer.frame = CGRect(x: (size.width - img.size.width) / 2,
                                      y: size.height * 0.07,
-                                     width: size.width,
-                                     height: h)
-
-                let anim = CABasicAnimation(keyPath: "opacity")
-                anim.fromValue = 1
-                anim.toValue = 1
-                anim.beginTime = AVCoreAnimationBeginTimeAtZero + c.start
-                anim.duration = max(0.15, c.end - c.start)
-                anim.isRemovedOnCompletion = false
-                anim.fillMode = .both
+                                     width: img.size.width,
+                                     height: img.size.height)
                 layer.opacity = 0
-                layer.add(anim, forKey: "show")
+
+                // 淡入 → 常亮 → 淡出，用关键帧把「这条字幕自己的时间段」说清楚。
+                // 之前用的是 from=1/to=1 的透明度动画，配合 fillMode=.both，
+                // 在动画开始之前也会套用起始值 1 —— 于是整段视频里所有字幕从第 0 秒就全亮着，
+                // 屏幕上就是「全部堆在一起」。关键帧第一个值是 0，从源头堵住。
+                let a = CAKeyframeAnimation(keyPath: "opacity")
+                a.values = [0, 1, 1, 0]
+                a.keyTimes = [0, 0.06, 0.94, 1]
+                a.beginTime = AVCoreAnimationBeginTimeAtZero + c.start
+                a.duration = max(0.30, c.end - c.start)
+                a.fillMode = .both
+                a.isRemovedOnCompletion = false
+                a.calculationMode = .linear
+                layer.add(a, forKey: "sub")
 
                 parent.addSublayer(layer)
             }

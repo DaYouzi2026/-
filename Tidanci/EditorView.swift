@@ -10,6 +10,7 @@ struct EditorView: View {
     @StateObject private var editor = VideoEditor()
     @State private var denoise = true
     @State private var subtitle = true
+    @State private var cutSilence = true
     @State private var result: URL?
     @State private var note: String?
     @State private var player: AVPlayer?
@@ -77,6 +78,11 @@ struct EditorView: View {
 
     private var options: some View {
         VStack(spacing: 12) {
+            toggleRow(icon: "scissors",
+                      title: "智能剪辑 · 掐气口",
+                      sub: "自动认出换气、卡壳的停顿并剪掉，成片更紧凑；残留一点呼吸声属于正常",
+                      isOn: $cutSilence)
+
             toggleRow(icon: "waveform",
                       title: "AI 降噪",
                       sub: "切掉空调声、风声这类持续低频噪音，人声更突出",
@@ -252,7 +258,10 @@ struct EditorView: View {
         player?.pause()
         player = nil
 
-        editor.run(input: item.url, denoise: denoise, subtitle: subtitle) { url, err in
+        editor.run(input: item.url,
+                   denoise: denoise,
+                   subtitle: subtitle,
+                   cutSilence: cutSilence) { url, err in
             if let u = url {
                 result = u
                 player = AVPlayer(url: u)

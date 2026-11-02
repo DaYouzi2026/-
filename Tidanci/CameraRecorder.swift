@@ -56,6 +56,21 @@ final class CameraRecorder: NSObject, ObservableObject {
     private var audioRate: Double = 44100
     private var audioChannels = 1
 
+    // 只在 audioQ 上读写
+    /// 录制期间把麦克风 PCM 另存一份。相机这条路万一没把音轨写进文件（首次启动最容易），
+    /// 用它把声音补回去 —— 「第一条视频没声音」不能再靠时序侥幸。
+    private var backupURL: URL?
+    private var backupFile: AVAudioFile?
+    private var backupOn = false
+    private var offsetFixed = false
+    private var lastAudioAt: CFTimeInterval = 0
+    /// 第一个音频帧比录制开始晚多少秒，补音时要把音频往后挪这么多
+    private var backupOffset: Double = 0
+    private var recordStartAt: CFTimeInterval = 0
+
+    /// 录制中盯着麦克风：太久没收到音频就把音频环境重新激活一次
+    private var audioWatch: DispatchSourceTimer?
+
     @Published private(set) var ready = false
     @Published private(set) var recording = false
     /// 实际生效的画质，比如 "4K·30"
@@ -90,11 +105,18 @@ final class CameraRecorder: NSObject, ObservableObject {
         self.fps = fps
         self.modeFlag = mode
         cfgQ.async {
+            AudioSession.forCamera()
             if self.session.inputs.isEmpty {
                 self.configure(front: front)
             }
             if !self.session.isRunning {
                 self.session.startRunning()
+            }
+            // 首次启动那一瞬间麦克风常常还没就绪：会话跑起来之后再补一次，这一次基本都能挂上
+            if self.audioIn == nil, AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
+                self.session.beginConfiguration()
+                self.addAudioInput()
+                self.session.commitConfiguration()
             }
             DispatchQueue.main.async {
                 self.ready = true
@@ -108,6 +130,8 @@ final class CameraRecorder: NSObject, ObservableObject {
             if self.session.isRunning {
                 self.session.stopRunning()
             }
+            // 会话停了就不再占麦克风；下次 start 会重新激活并补齐音频输入
+            AudioSession.release()
             DispatchQueue.main.async { self.ready = false }
         }
     }
@@ -184,6 +208,11 @@ final class CameraRecorder: NSObject, ObservableObject {
     // MARK: - 配置
 
     private func configure(front: Bool) {
+        // 自己管音频环境。交给系统自动配置的话，语音识别一启动就会把配置换掉，
+        // 相机这一路当场失声（详见 AudioSession.swift 的说明）。
+        session.automaticallyConfiguresApplicationAudioSession = false
+        AudioSession.forCamera()
+
         session.beginConfiguration()
         defer { session.commitConfiguration() }
         frontFlag = front
@@ -210,16 +239,48 @@ final class CameraRecorder: NSObject, ObservableObject {
             return
         }
 
-        if let mic = AVCaptureDevice.default(for: .audio),
-           let ai = try? AVCaptureDeviceInput(device: mic),
-           session.canAddInput(ai) {
-            session.addInput(ai)
-            audioIn = ai
-        }
+        addAudioInput()
 
         applyFormat(dev)
         configureOutputs()
         publishActual(dev, front: front)
+    }
+
+    /// 加麦克风输入。首次授权那一刻音频设备常常还没就绪，`AVCaptureDeviceInput` 会直接抛错；
+    /// 老代码用 `try?` 吞掉就再也没重试过，整场相机会话都是哑的 —— 这就是「第一条视频没声音」。
+    @discardableResult
+    private func addAudioInput() -> Bool {
+        if audioIn != nil { return true }
+        guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else { return false }
+        guard let mic = AVCaptureDevice.default(for: .audio) else { return false }
+        do {
+            let ai = try AVCaptureDeviceInput(device: mic)
+            guard session.canAddInput(ai) else { return false }
+            session.addInput(ai)
+            audioIn = ai
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// 录制前补齐音频输入。首次启动相机、刚授权、或者被别的 App 打断过之后都可能缺一路，
+    /// 缺了就一定录出无声视频，所以每次开录前都确认一遍。
+    private func ensureAudioInput(then done: @escaping (Bool) -> Void) {
+        cfgQ.async {
+            if self.audioIn != nil, self.session.inputs.contains(where: { $0 === self.audioIn }) {
+                DispatchQueue.main.async { done(true) }
+                return
+            }
+            self.session.beginConfiguration()
+            let ok = self.addAudioInput()
+            if ok {
+                // 输入变了，输出连接会重建，镜像要重新设一遍
+                self.applyMirror()
+            }
+            self.session.commitConfiguration()
+            DispatchQueue.main.async { done(ok) }
+        }
     }
 
     private func configureOutputs() {
@@ -361,25 +422,32 @@ final class CameraRecorder: NSObject, ObservableObject {
     // MARK: - 录制
 
     func startRecording(to url: URL) {
+        beginAudioBackup()
+
         if modeFlag == .native {
-            cfgQ.async {
-                guard self.movieOut.isRecording == false else { return }
-                if let c = self.movieOut.connection(with: .video), c.isVideoOrientationSupported {
-                    c.videoOrientation = .portrait
+            ensureAudioInput { ok in
+                self.cfgQ.async {
+                    guard self.movieOut.isRecording == false else { return }
+                    // 开录这一刻把音频环境再抢回来：跟读的语音识别可能刚把它改成「只录音」
+                    AudioSession.forCamera()
+                    if let c = self.movieOut.connection(with: .video), c.isVideoOrientationSupported {
+                        c.videoOrientation = .portrait
+                    }
+                    // 录制开始前再确认一次镜像，避免切镜头后连接被重建
+                    self.applyMirror()
+                    try? FileManager.default.removeItem(at: url)
+                    DispatchQueue.main.async {
+                        self.recordingError = ok ? "" : "麦克风没接上，这条可能没有声音"
+                        self.recording = true
+                    }
+                    self.movieOut.startRecording(to: url, recordingDelegate: self)
                 }
-                // 录制开始前再确认一次镜像，避免切镜头后连接被重建
-                self.applyMirror()
-                try? FileManager.default.removeItem(at: url)
-                DispatchQueue.main.async {
-                    self.recordingError = ""
-                    self.recording = true
-                }
-                self.movieOut.startRecording(to: url, recordingDelegate: self)
             }
             return
         }
 
         videoQ.async {
+            AudioSession.forCamera()
             self.pendingURL = url
             self.writerReady = false
             self.recordingFlag = true
@@ -405,7 +473,14 @@ final class CameraRecorder: NSObject, ObservableObject {
             self.recordingFlag = false
             DispatchQueue.main.async { self.recording = false }
             self.writer.finish { url in
-                self.onFinish?(url)
+                guard let u = url else {
+                    self.endAudioBackup { _, _ in }
+                    self.onFinish?(nil)
+                    return
+                }
+                self.repairAudioIfNeeded(u) { fixed in
+                    self.onFinish?(fixed)
+                }
             }
         }
     }
@@ -484,6 +559,153 @@ final class CameraRecorder: NSObject, ObservableObject {
         return pb
     }
 
+    // MARK: - 音频备份（兜住「这条没声音」）
+
+    /// 开录时在临时目录挂一个 CAF，把麦克风 PCM 原样写进去。正常情况用不上；
+    /// 一旦相机会话没把音轨写进文件（首次启动最容易），就拿它把声音补回去。
+    private func beginAudioBackup() {
+        audioQ.async {
+            self.backupOn = true
+            self.backupFile = nil
+            self.offsetFixed = false
+            self.backupOffset = 0
+            self.recordStartAt = CACurrentMediaTime()
+            self.lastAudioAt = self.recordStartAt
+
+            let dir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("tidanci-audio", isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let u = dir.appendingPathComponent("backup.caf")
+            try? FileManager.default.removeItem(at: u)
+            self.backupURL = u
+
+            // 录制中盯着麦克风：连续 1.2 秒没有音频帧，说明环境又被别人改掉了，重新激活一次
+            let t = DispatchSource.makeTimerSource(queue: self.audioQ)
+            t.schedule(deadline: .now() + 0.8, repeating: 0.5)
+            t.setEventHandler { [weak self] in
+                guard let self, self.backupOn, self.lastAudioAt > 0 else { return }
+                if CACurrentMediaTime() - self.lastAudioAt > 1.2 {
+                    AudioSession.forCamera()
+                    self.lastAudioAt = CACurrentMediaTime()
+                }
+            }
+            self.audioWatch?.cancel()
+            self.audioWatch = t
+            t.resume()
+        }
+    }
+
+    /// 录制结束：关掉备份并交出文件地址。必须等 AVAudioFile 放手（文件写完）再读，
+    /// 否则读到的是半个文件，补进去的音频会截断。
+    private func endAudioBackup(_ done: @escaping (URL?, Double) -> Void) {
+        audioQ.async {
+            self.backupOn = false
+            self.audioWatch?.cancel()
+            self.audioWatch = nil
+            self.backupFile = nil
+            let u = self.backupURL
+            var size = 0
+            if let path = u?.path {
+                size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int ?? 0
+            }
+            let off = self.backupOffset
+            DispatchQueue.main.async { done(size > 2048 ? u : nil, off) }
+        }
+    }
+
+    private func appendAudioBackup(_ pcm: AVAudioPCMBuffer) {
+        guard backupOn else { return }
+        let now = CACurrentMediaTime()
+        if !offsetFixed {
+            offsetFixed = true
+            backupOffset = max(0, min(1.5, now - recordStartAt))
+        }
+        lastAudioAt = now
+        if backupFile == nil {
+            guard let u = backupURL else { return }
+            backupFile = try? AVAudioFile(forWriting: u, settings: pcm.format.settings)
+        }
+        try? backupFile?.write(from: pcm)
+    }
+
+    /// 成片没音轨、或者音轨全静音，就用备份 PCM 补一条进去；正常就原样返回。
+    private func repairAudioIfNeeded(_ video: URL, done: @escaping (URL?) -> Void) {
+        endAudioBackup { backup, offset in
+            guard let b = backup else {
+                done(video)
+                return
+            }
+            DispatchQueue.global(qos: .userInitiated).async {
+                // 光有音轨不算数：采集没出帧时系统也会挂一条空音轨，播出来一样是哑的
+                let hasTrack = !AVURLAsset(url: video).tracks(withMediaType: .audio).isEmpty
+                let videoOk = hasTrack && SilenceCut.peakDb(video) > -52
+                let backupOk = SilenceCut.peakDb(b) > -52
+                DispatchQueue.main.async {
+                    guard !videoOk, backupOk else {
+                        done(video)
+                        return
+                    }
+                    self.mux(video: video, audio: b, offset: offset, done: done)
+                }
+            }
+        }
+    }
+
+    private func mux(video: URL, audio: URL, offset: Double, done: @escaping (URL?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let comp = AVMutableComposition()
+            let va = AVURLAsset(url: video)
+            let aa = AVURLAsset(url: audio)
+            guard let vt = va.tracks(withMediaType: .video).first,
+                  let vt2 = comp.addMutableTrack(withMediaType: .video,
+                                                 preferredTrackID: kCMPersistentTrackID_Invalid),
+                  let at = aa.tracks(withMediaType: .audio).first,
+                  let at2 = comp.addMutableTrack(withMediaType: .audio,
+                                                 preferredTrackID: kCMPersistentTrackID_Invalid) else {
+                DispatchQueue.main.async { done(video) }
+                return
+            }
+            let vd = va.duration
+            try? vt2.insertTimeRange(CMTimeRange(start: .zero, duration: vd), of: vt, at: .zero)
+            vt2.preferredTransform = vt.preferredTransform
+
+            let start = CMTime(seconds: offset, preferredTimescale: 600)
+            let len = max(0, vd.seconds - offset)
+            if len > 0.1 {
+                try? at2.insertTimeRange(CMTimeRange(start: .zero,
+                                                     duration: CMTime(seconds: len, preferredTimescale: 600)),
+                                         of: at,
+                                         at: start)
+            }
+
+            let tmp = FileManager.default.temporaryDirectory
+                .appendingPathComponent("tidanci-fix-\(UUID().uuidString)")
+                .appendingPathExtension(video.pathExtension.isEmpty ? "mp4" : video.pathExtension)
+            try? FileManager.default.removeItem(at: tmp)
+
+            guard let ex = AVAssetExportSession(asset: comp,
+                                                presetName: AVAssetExportPresetHighestQuality) else {
+                DispatchQueue.main.async { done(video) }
+                return
+            }
+            ex.outputURL = tmp
+            ex.outputFileType = video.pathExtension.lowercased() == "mov" ? .mov : .mp4
+            ex.exportAsynchronously {
+                DispatchQueue.main.async {
+                    guard ex.status == .completed,
+                          FileManager.default.fileExists(atPath: tmp.path) else {
+                        try? FileManager.default.removeItem(at: tmp)
+                        done(video)
+                        return
+                    }
+                    _ = try? FileManager.default.replaceItemAt(video, withItemAt: tmp)
+                    self.recordingError = "原声没进文件，已用备份音轨补上"
+                    done(video)
+                }
+            }
+        }
+    }
+
     private func handleAudio(_ sb: CMSampleBuffer) {
         if let fd = CMSampleBufferGetFormatDescription(sb),
            let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd) {
@@ -500,6 +722,7 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
 
         if let pcm = CameraRecorder.toPCM(sb) {
+            if backupOn { appendAudioBackup(pcm) }
             onAudio?(pcm)
         }
     }
@@ -554,7 +777,15 @@ extension CameraRecorder: AVCaptureFileOutputRecordingDelegate {
         DispatchQueue.main.async {
             self.recording = false
             if !msg.isEmpty { self.recordingError = msg }
-            self.onFinish?(finished ? outputFileURL : nil)
+            guard finished else {
+                self.endAudioBackup { _, _ in }
+                self.onFinish?(nil)
+                return
+            }
+            // 万一这条路没把音轨写进文件，用录制期间备份的 PCM 补上，别让用户白录一条
+            self.repairAudioIfNeeded(outputFileURL) { url in
+                self.onFinish?(url)
+            }
         }
     }
 }

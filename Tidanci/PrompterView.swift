@@ -715,7 +715,7 @@ struct PrompterView: View {
             if autoSave {
                 PhotoSaver.save(url) { _, _ in }
             }
-            showTip("已保存 " + url.lastPathComponent)
+            showTip(cam.recordingError.isEmpty ? "已保存 " + url.lastPathComponent : cam.recordingError)
         } else {
             showTip(cam.recordingError.isEmpty ? "录制失败，再试一次" : cam.recordingError)
         }
