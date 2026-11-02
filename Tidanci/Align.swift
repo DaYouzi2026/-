@@ -214,6 +214,9 @@ final class Follower {
     private var prevRun: [Int] = []
     private var ins: [Int] = []
     private var prevIns: [Int] = []
+    /// 沿最优路径「读音对得上」的字数（不要求连续），比平均代价更能扛零散错字
+    private var good: [Int] = []
+    private var prevGood: [Int] = []
 
     /// 句子起点，构造时取一次。别写成计算属性——每个候选位置都会查一次，
     /// 计算属性会每次都复制一遍数组，直接把这个函数拖成性能瓶颈。
@@ -239,9 +242,17 @@ final class Follower {
     }
 
     /// 这个候选位置该不该放行
-    private func pass(_ jump: Int, _ raw: Float, _ runLen: Int, _ eff: Int) -> Bool {
+    private func pass(_ jump: Int, _ raw: Float, _ runLen: Int, _ eff: Int, _ good: Int) -> Bool {
         let dist = abs(jump)
         let th = thFor(eff)
+
+        // 硬证据：末尾连续对上 5 个字以上。识别器可能把前面一截听成乱码，
+        // 但「刚说出口的这几个字」它几乎不会错——比平均代价可靠得多。
+        // 少了这两条，光标一落后十几格就再也追不回来（就是「读了不翻页」）。
+        if runLen >= 5 && dist <= 24 { return true }
+        if runLen >= 7 { return true }
+        // 命中率高：十几个字里有四分之三同音，位置基本不会错
+        if eff >= 8 && good >= (eff * 3) / 4 && dist <= 16 { return true }
 
         // 第一道：证据长度上限。这几个字最多能证明光标走了多远。
         // 「只说两个字就把画面拽走二十格」就是漏了这一道。
@@ -395,16 +406,20 @@ final class Follower {
             prevRun = d
             ins = d
             prevIns = d
+            good = d
+            prevGood = d
         }
 
         // 初始行：探针前 j 个字全当「识别多出来的」
         prev[0] = 0
         prevRun[0] = 0
         prevIns[0] = 0
+        prevGood[0] = 0
         for j in 1...k {
             prev[j] = j * GAP
             prevRun[j] = 0
             prevIns[j] = j
+            prevGood[j] = 0
         }
 
         var bestI = -1
@@ -417,6 +432,7 @@ final class Follower {
             d[0] = 0                                  // 起点自由
             run[0] = 0
             ins[0] = 0
+            good[0] = 0
 
             var j = 1
             while j <= k {
@@ -435,6 +451,8 @@ final class Follower {
 
                 // 沿最优路径数的「末尾连续对上了几个字」
                 run[j] = c <= GOOD ? prevRun[j - 1] + 1 : 0
+                good[j] = (c <= GOOD ? 1 : 0)
+                    + (v == sub ? prevGood[j - 1] : (v == del ? prevGood[j] : good[j - 1]))
                 j += 1
             }
 
@@ -446,7 +464,7 @@ final class Follower {
 
             let jump = i - after
             let raw = Float(d[k]) / (100.0 * Float(eff))
-            if pass(jump, raw, run[k], eff) {
+            if pass(jump, raw, run[k], eff, good[k]) {
                 var rank = raw + distPenalty(jump)
                 if nearSentenceStart(i, 1) { rank -= 0.015 }
                 if rank < bestRank {
@@ -459,6 +477,7 @@ final class Follower {
             let t1 = prev; prev = d; d = t1
             let t2 = prevRun; prevRun = run; run = t2
             let t3 = prevIns; prevIns = ins; ins = t3
+            let t4 = prevGood; prevGood = good; good = t4
             i += 1
         }
 

@@ -57,6 +57,12 @@ final class SpeechFollower: ObservableObject {
     private var lastAudioAt = Date()
     private var lastRestartAt = Date.distantPast
     private var timer: Timer?
+    /// 上一句识别结果的尾巴。识别请求一重开，transcript 就从零开始——
+    /// 这时探针只剩两三个字，对齐根本不敢往前挪（这就是「读了不翻页」的机器原因）。
+    /// 把上一句最后十个字留作前缀，探针就永远是十几个字，能立刻追上。
+    private var carry = ""
+    private var lastText = ""
+    private var lastTextAt = Date.distantPast
 
     // 重采样到 16k 单声道
     private let pcm16k = AVAudioFormat(commonFormat: .pcmFormatFloat32,
@@ -101,6 +107,8 @@ final class SpeechFollower: ObservableObject {
             return
         }
         if wantRun && running { return }
+        carry = ""
+        lastText = ""
         wantRun = true
         running = true
         fails = 0
@@ -124,6 +132,8 @@ final class SpeechFollower: ObservableObject {
         lock.unlock()
         r?.endAudio()
         t?.cancel()
+        carry = ""
+        lastText = ""
         status = ""
         heard = ""
     }
@@ -152,6 +162,12 @@ final class SpeechFollower: ObservableObject {
             r.contextualStrings = Array(list.prefix(60))
         }
 
+        // 把上一句的尾巴接过来当上下文（太久以前的就丢掉，免得跑到别的段落还被拽回来）
+        let stale = Date().timeIntervalSince(lastTextAt) > 12
+        let kept = lastText.filter { PreparedScript.keep($0) }
+        carry = (stale || kept.isEmpty) ? "" : String(kept.suffix(10))
+        lastText = ""
+
         // 换请求就重来一遍格式判断，别让上一段的转换状态漏过来
         conv = nil
         convIn = nil
@@ -174,8 +190,10 @@ final class SpeechFollower: ObservableObject {
                     let text = result.bestTranscription.formattedString
                     if !text.isEmpty {
                         self.heard = text
+                        self.lastText = text
+                        self.lastTextAt = Date()
                         self.status = self.usingOnDevice ? "离线识别中" : "在线识别中"
-                        self.onText?(text)
+                        self.onText?(self.composed(text))
                     }
                     if result.isFinal {
                         // 一句话说完了，系统这个请求也结束了，换一个新的接着听。
@@ -193,6 +211,15 @@ final class SpeechFollower: ObservableObject {
         lock.lock()
         task = t
         lock.unlock()
+    }
+
+    /// 新请求刚开头的两三个字，前面补上上一句的尾巴，凑够能被信任的探针长度。
+    /// 一旦这一句自己长到六个字以上，就不需要拐杖了，果断丢掉。
+    private func composed(_ text: String) -> String {
+        if carry.isEmpty { return text }
+        let kept = text.filter { PreparedScript.keep($0) }
+        if kept.count >= 6 { return text }
+        return carry + text
     }
 
     private func handle(_ e: NSError, rec: SFSpeechRecognizer) {
