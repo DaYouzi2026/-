@@ -15,6 +15,7 @@ struct SettingsView: View {
     @AppStorage(Pref.followOn) private var followOn = true
 
     @State private var toast: String?
+    @State private var crashText: String?
 
     private var quality: VideoQuality { VideoQuality(rawValue: qualityRaw) ?? .uhd }
     private var frame: FrameRate { FrameRate(rawValue: fps) ?? .fps30 }
@@ -51,6 +52,7 @@ struct SettingsView: View {
                 }
             }
             .navigationBarHidden(true)
+            .onAppear { crashText = CrashLog.read() }
         }
     }
 
@@ -250,17 +252,63 @@ struct SettingsView: View {
                 HStack {
                     Text("提词大师").font(.system(size: 14, weight: .semibold)).foregroundColor(T.ink)
                     Spacer()
-                    Text("1.0")
+                    Text("1.11")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundColor(T.sub)
                 }
-                Text("跟读用系统自带的中文离线识别，声音不出本机。台本、视频都只存在这台手机上。")
+                Text("跟读用系统自带的中文识别，声音不出本机。台本、视频都只存在这台手机上。")
                     .font(.system(size: 11))
                     .foregroundColor(T.sub)
                     .fixedSize(horizontal: false, vertical: true)
             }
             .padding(16)
+
+            RowDivider()
+
+            crashRow
         }
+    }
+
+    /// 闪退自证：上次崩溃的原因直接摆在设置里，截图发过来就能定位
+    @ViewBuilder
+    private var crashRow: some View {
+        let log = crashText
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("上次闪退")
+                    .font(.system(size: 13))
+                    .foregroundColor(T.ink2)
+                Spacer()
+                if log == nil {
+                    Text("没有记录").font(.system(size: 12)).foregroundColor(T.sub)
+                } else {
+                    Button {
+                        CrashLog.clear()
+                        crashText = CrashLog.read()
+                        show("已清掉记录")
+                    } label: {
+                        Text("清掉")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(T.accent)
+                    }
+                }
+            }
+            if let log {
+                Text(log)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(T.sub)
+                    .lineLimit(12)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(T.surface2)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                Text("把这张图截给我，就知道崩在哪一行了")
+                    .font(.system(size: 10))
+                    .foregroundColor(T.sub)
+            }
+        }
+        .padding(16)
     }
 
     private func show(_ t: String) {

@@ -59,8 +59,15 @@ final class CameraRecorder: NSObject, ObservableObject {
     // 只在 audioQ 上读写
     /// 录制期间把麦克风 PCM 另存一份。相机这条路万一没把音轨写进文件（首次启动最容易），
     /// 用它把声音补回去 —— 「第一条视频没声音」不能再靠时序侥幸。
+    ///
+    /// 这里手写 WAV，不用 AVAudioFile：`AVAudioFile(forWriting:settings:)` 在格式
+    /// （采样率/声道/是否交错）对不上时会抛 Objective-C 异常，Swift 的 try 抓不住，
+    /// 直接闪退。自己拼 44 字节头 + 追加 Int16，永远不会有异常。
     private var backupURL: URL?
-    private var backupFile: AVAudioFile?
+    private var backupHandle: FileHandle?
+    private var backupFrames = 0
+    private var backupRate: Double = 48000
+    private var backupChannels = 1
     private var backupOn = false
     private var offsetFixed = false
     private var lastAudioAt: CFTimeInterval = 0
@@ -109,14 +116,15 @@ final class CameraRecorder: NSObject, ObservableObject {
             if self.session.inputs.isEmpty {
                 self.configure(front: front)
             }
-            if !self.session.isRunning {
-                self.session.startRunning()
-            }
-            // 首次启动那一瞬间麦克风常常还没就绪：会话跑起来之后再补一次，这一次基本都能挂上
+            // 首次授权那一瞬间麦克风常常还没就绪。在会话「跑起来之前」再补一次，
+            // 这时候加输入不会打断任何东西；跑起来之后再动会话才是危险的。
             if self.audioIn == nil, AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
                 self.session.beginConfiguration()
                 self.addAudioInput()
                 self.session.commitConfiguration()
+            }
+            if !self.session.isRunning {
+                self.session.startRunning()
             }
             DispatchQueue.main.async {
                 self.ready = true
@@ -208,14 +216,6 @@ final class CameraRecorder: NSObject, ObservableObject {
     // MARK: - 配置
 
     private func configure(front: Bool) {
-        // 自己管音频环境。交给系统自动配置的话，语音识别一启动就会把配置换掉，
-        // 相机这一路当场失声（详见 AudioSession.swift 的说明）。
-        // iOS 17 起这个开关改名成 usesApplicationAudioSession，老名字不再起作用。
-        if #available(iOS 17.0, *) {
-            session.usesApplicationAudioSession = true
-        } else {
-            session.automaticallyConfiguresApplicationAudioSession = false
-        }
         AudioSession.forCamera()
 
         session.beginConfiguration()
@@ -430,29 +430,19 @@ final class CameraRecorder: NSObject, ObservableObject {
         beginAudioBackup()
 
         if modeFlag == .native {
-            ensureAudioInput { ok in
-                self.cfgQ.async {
-                    guard self.movieOut.isRecording == false else { return }
-                    // 开录这一刻把音频环境再抢回来：跟读的语音识别可能刚把它改成「只录音」
-                    AudioSession.forCamera()
-                    if let c = self.movieOut.connection(with: .video), c.isVideoOrientationSupported {
-                        c.videoOrientation = .portrait
-                    }
-                    // 录制开始前再确认一次镜像，避免切镜头后连接被重建
-                    self.applyMirror()
-                    try? FileManager.default.removeItem(at: url)
-                    DispatchQueue.main.async {
-                        self.recordingError = ok ? "" : "麦克风没接上，这条可能没有声音"
-                        self.recording = true
-                    }
-                    self.movieOut.startRecording(to: url, recordingDelegate: self)
+            // 正常情况下一个字都不改，直接开录（1.9 就是这么跑的，稳）。
+            // 只有在「一个麦克风输入都没有」这种异常状态，才补一次输入再开录。
+            if audioIn == nil, AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
+                ensureAudioInput { ok in
+                    self.beginNativeRecording(url: url, micOK: ok)
                 }
+            } else {
+                beginNativeRecording(url: url, micOK: audioIn != nil)
             }
             return
         }
 
         videoQ.async {
-            AudioSession.forCamera()
             self.pendingURL = url
             self.writerReady = false
             self.recordingFlag = true
@@ -460,6 +450,37 @@ final class CameraRecorder: NSObject, ObservableObject {
                 self.recordingError = ""
                 self.recording = true
             }
+        }
+    }
+
+    private func beginNativeRecording(url: URL, micOK: Bool) {
+        cfgQ.async {
+            guard self.movieOut.isRecording == false else { return }
+            if !self.session.isRunning {
+                self.session.startRunning()
+            }
+            AudioSession.keepAlive()
+            if let c = self.movieOut.connection(with: .video), c.isVideoOrientationSupported {
+                c.videoOrientation = .portrait
+            }
+            // 录制开始前再确认一次镜像，避免切镜头后连接被重建
+            self.applyMirror()
+
+            // 没有可用的视频连接时 startRecording 会直接抛 Objective-C 异常（闪退），先确认再开
+            guard let vc = self.movieOut.connection(with: .video), vc.isEnabled else {
+                DispatchQueue.main.async {
+                    self.recording = false
+                    self.recordingError = "画面还没准备好，再点一次"
+                }
+                return
+            }
+
+            try? FileManager.default.removeItem(at: url)
+            DispatchQueue.main.async {
+                self.recordingError = micOK ? "" : "麦克风没接上，这条可能没有声音"
+                self.recording = true
+            }
+            self.movieOut.startRecording(to: url, recordingDelegate: self)
         }
     }
 
@@ -571,7 +592,8 @@ final class CameraRecorder: NSObject, ObservableObject {
     private func beginAudioBackup() {
         audioQ.async {
             self.backupOn = true
-            self.backupFile = nil
+            self.closeBackupFile()
+            self.backupFrames = 0
             self.offsetFixed = false
             self.backupOffset = 0
             self.recordStartAt = CACurrentMediaTime()
@@ -580,9 +602,15 @@ final class CameraRecorder: NSObject, ObservableObject {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent("tidanci-audio", isDirectory: true)
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let u = dir.appendingPathComponent("backup.caf")
+            let u = dir.appendingPathComponent("backup.wav")
             try? FileManager.default.removeItem(at: u)
             self.backupURL = u
+
+            // 先占位 44 字节头，等录完再回填长度
+            if FileManager.default.createFile(atPath: u.path, contents: Data(count: 44)) {
+                self.backupHandle = FileHandle(forWritingAtPath: u.path)
+                try? self.backupHandle?.seekToEnd()
+            }
 
             // 录制中盯着麦克风：连续 1.2 秒没有音频帧，说明环境又被别人改掉了，重新激活一次
             let t = DispatchSource.makeTimerSource(queue: self.audioQ)
@@ -590,7 +618,8 @@ final class CameraRecorder: NSObject, ObservableObject {
             t.setEventHandler { [weak self] in
                 guard let self, self.backupOn, self.lastAudioAt > 0 else { return }
                 if CACurrentMediaTime() - self.lastAudioAt > 1.2 {
-                    AudioSession.forCamera()
+                    // 只补激活，不换类别：正在跑的采集最怕类别被改
+                    AudioSession.keepAlive()
                     self.lastAudioAt = CACurrentMediaTime()
                 }
             }
@@ -600,37 +629,101 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
     }
 
-    /// 录制结束：关掉备份并交出文件地址。必须等 AVAudioFile 放手（文件写完）再读，
+    private func closeBackupFile() {
+        if let h = backupHandle {
+            // 回填 WAV 头
+            let dataBytes = backupFrames * backupChannels * 2
+            var head = Data()
+            func le32(_ v: UInt32) { var x = v.littleEndian; withUnsafeBytes(of: &x) { head.append(contentsOf: $0) } }
+            func le16(_ v: UInt16) { var x = v.littleEndian; withUnsafeBytes(of: &x) { head.append(contentsOf: $0) } }
+            head.append(contentsOf: Array("RIFF".utf8))
+            le32(UInt32(36 + dataBytes))
+            head.append(contentsOf: Array("WAVEfmt ".utf8))
+            le32(16)                                  // fmt 块长度
+            le16(1)                                   // PCM
+            le16(UInt16(max(1, backupChannels)))
+            le32(UInt32(backupRate))
+            le32(UInt32(backupRate) * UInt32(max(1, backupChannels)) * 2)   // byteRate
+            le16(UInt16(max(1, backupChannels) * 2))                        // blockAlign
+            le16(16)                                  // 位深
+            head.append(contentsOf: Array("data".utf8))
+            le32(UInt32(dataBytes))
+
+            try? h.seek(toOffset: 0)
+            try? h.write(contentsOf: head)
+            try? h.close()
+            backupHandle = nil
+        }
+    }
+
+    /// 录制结束：关掉备份并交出文件地址。必须等文件写完再读，
     /// 否则读到的是半个文件，补进去的音频会截断。
     private func endAudioBackup(_ done: @escaping (URL?, Double) -> Void) {
         audioQ.async {
             self.backupOn = false
             self.audioWatch?.cancel()
             self.audioWatch = nil
-            self.backupFile = nil
+            self.closeBackupFile()
             let u = self.backupURL
             var size = 0
             if let path = u?.path {
                 size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int ?? 0
             }
             let off = self.backupOffset
-            DispatchQueue.main.async { done(size > 2048 ? u : nil, off) }
+            DispatchQueue.main.async { done(size > 4096 ? u : nil, off) }
         }
     }
 
+    /// 把一帧 PCM 追加成 16 位小端。任何看不懂的格式直接放弃备份，
+    /// 绝不在这里赌异常（赌输就是闪退）。
     private func appendAudioBackup(_ pcm: AVAudioPCMBuffer) {
-        guard backupOn else { return }
+        guard backupOn, let h = backupHandle else { return }
+        let fmt = pcm.format
+        let frames = Int(pcm.frameLength)
+        let ch = Int(fmt.channelCount)
+        guard frames > 0, ch > 0, fmt.sampleRate > 8000 else { return }
+
+        backupRate = fmt.sampleRate
+        backupChannels = ch
+
+        var data = Data()
+        data.reserveCapacity(frames * ch * 2)
+
+        if fmt.commonFormat == .pcmFormatFloat32, let src = pcm.floatChannelData {
+            let interleaved = fmt.isInterleaved
+            for i in 0..<frames {
+                for c in 0..<ch {
+                    let raw = interleaved ? src[0][i * ch + c] : src[c][i]
+                    let v = max(-1, min(1, raw))
+                    var s = Int16(v * 32767)
+                    withUnsafeBytes(of: &s) { data.append(contentsOf: $0) }
+                }
+            }
+        } else if fmt.commonFormat == .pcmFormatInt16, let src = pcm.int16ChannelData {
+            let interleaved = fmt.isInterleaved
+            for i in 0..<frames {
+                for c in 0..<ch {
+                    var s = interleaved ? src[0][i * ch + c] : src[c][i]
+                    withUnsafeBytes(of: &s) { data.append(contentsOf: $0) }
+                }
+            }
+        } else {
+            // 32 位整数 / 定点：没见过，直接放弃备份，画面照录
+            backupOn = false
+            return
+        }
+
+        if !data.isEmpty {
+            try? h.write(contentsOf: data)
+            backupFrames += frames
+        }
+
         let now = CACurrentMediaTime()
         if !offsetFixed {
             offsetFixed = true
             backupOffset = max(0, min(1.5, now - recordStartAt))
         }
         lastAudioAt = now
-        if backupFile == nil {
-            guard let u = backupURL else { return }
-            backupFile = try? AVAudioFile(forWriting: u, settings: pcm.format.settings)
-        }
-        try? backupFile?.write(from: pcm)
     }
 
     /// 成片没音轨、或者音轨全静音，就用备份 PCM 补一条进去；正常就原样返回。

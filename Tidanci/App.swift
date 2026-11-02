@@ -5,6 +5,11 @@ import UIKit
 struct TidanciApp: App {
     @StateObject private var store = Store()
 
+    init() {
+        // 上一次闪退的原因写到沙盒里，「我的 → 关于」能看到
+        CrashLog.install()
+    }
+
     var body: some Scene {
         WindowGroup {
             RootView()
