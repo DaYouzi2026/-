@@ -210,7 +210,12 @@ final class CameraRecorder: NSObject, ObservableObject {
     private func configure(front: Bool) {
         // 自己管音频环境。交给系统自动配置的话，语音识别一启动就会把配置换掉，
         // 相机这一路当场失声（详见 AudioSession.swift 的说明）。
-        session.automaticallyConfiguresApplicationAudioSession = false
+        // iOS 17 起这个开关改名成 usesApplicationAudioSession，老名字不再起作用。
+        if #available(iOS 17.0, *) {
+            session.usesApplicationAudioSession = true
+        } else {
+            session.automaticallyConfiguresApplicationAudioSession = false
+        }
         AudioSession.forCamera()
 
         session.beginConfiguration()
