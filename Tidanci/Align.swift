@@ -233,7 +233,12 @@ final class Follower {
         if dist <= 6 { return raw <= th }
         if jump > 0 {
             if dist <= 20 { return raw <= th * 0.84 }
-            if nearSentenceStart(jump + cursor, 3) { return raw <= th * 0.66 }
+            // 跳读是从下一句的开头读起的，所以对齐的**起点**应该落在句首。
+            // 不能只看终点：念了 6 个字，终点就在句首后面 6 个字
+            let end = jump + cursor
+            if nearSentenceStart(end, 3) || nearSentenceStart(end - eff, 4) {
+                return raw <= th * 0.66
+            }
             return raw <= th * 0.38 && runLen >= min(4, eff)
         }
         if dist <= 20 { return raw <= th * 0.92 }
