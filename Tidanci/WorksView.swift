@@ -189,6 +189,7 @@ struct PlaySheet: View {
     @State private var player: AVPlayer
     @State private var tip: String?
     @State private var confirmDelete = false
+    @State private var editing = false
 
     init(item: WorkItem) {
         self.item = item
@@ -205,7 +206,15 @@ struct PlaySheet: View {
                     .onAppear { player.play() }
                     .onDisappear { player.pause() }
 
-                HStack(spacing: 10) {
+                HStack(spacing: 9) {
+                    Button {
+                        player.pause()
+                        editing = true
+                    } label: {
+                        actionLabel("编辑", "wand.and.stars", T.accent2)
+                    }
+                    .pressable()
+
                     Button {
                         PhotoSaver.save(item.url) { ok, msg in
                             tip = ok ? "已存进相册" : (msg.isEmpty ? "保存失败" : msg)
@@ -251,6 +260,10 @@ struct PlaySheet: View {
                     dismiss()
                 }
                 Button("取消", role: .cancel) {}
+            }
+            .sheet(isPresented: $editing) {
+                EditorView(item: item)
+                    .environmentObject(store)
             }
         }
     }
