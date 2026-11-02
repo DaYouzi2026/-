@@ -136,6 +136,31 @@ struct PreparedScript {
     }
 
     var isEmpty: Bool { norm.isEmpty }
+
+    /// 游标附近的一批短句（按句读切开），拿去当语音识别的提示词。
+    ///
+    /// 读稿是「已知内容」场景：把接下来要念的原句喂给 SFSpeechRecognizer，
+    /// 它会优先往这些词上靠，同音字（在/再、是/事）和人名地名会准很多。
+    /// 只取游标附近，不整篇塞——提示词越杂，反而越容易把远处的词听进来。
+    func nearbySentences(cursor: Int, back: Int = 2, ahead: Int = 12) -> [String] {
+        let heads = sentenceStarts
+        guard !heads.isEmpty, !norm.isEmpty else { return [] }
+        let n = norm.count
+        let c = min(max(cursor, 0), n)
+        var idx = 0
+        for (k, h) in heads.enumerated() where h <= c { idx = k }
+        let lo = max(0, idx - back)
+        let hi = min(heads.count - 1, idx + ahead)
+        guard lo <= hi else { return [] }
+        var out: [String] = []
+        for k in lo...hi {
+            let a = heads[k]
+            let b = (k + 1 < heads.count) ? heads[k + 1] : n
+            guard b > a, b - a >= 2 else { continue }
+            out.append(String(norm[a..<b]))
+        }
+        return out
+    }
 }
 
 // MARK: - 对齐

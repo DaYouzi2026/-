@@ -251,7 +251,10 @@ struct PrompterView: View {
     private var statusLine: String {
         if engine.prepared.isEmpty { return "台本是空的" }
         if followOn && speech.running {
-            return "\(speech.onDevice ? "离线跟读" : "跟读") · " + engine.upcoming
+            let s = speech.status
+            // 异常提示（没收到麦克风 / 正在重开 / 换离线）优先显示，别让用户以为它还在工作
+            if !s.isEmpty && s != "在线识别中" && s != "离线识别中" { return s }
+            return (speech.onDevice ? "离线跟读 · " : "在线跟读 · ") + engine.upcoming
         }
         if autoScroll { return "匀速滚动中" }
         return statusText
@@ -767,6 +770,12 @@ struct PrompterView: View {
             }
             speech.onText = { text in engine.feed(text) }
             speech.onFail = { m in statusText = m }
+            // 把接下来要念的原句当识别提示词，同音字/人名会准很多
+            speech.hints = {
+                let p = engine.prepared
+                if p.isEmpty { return [] }
+                return p.nearbySentences(cursor: engine.cursor)
+            }
             speech.start()
         }
     }
