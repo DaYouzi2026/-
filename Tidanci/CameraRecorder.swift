@@ -118,10 +118,19 @@ final class CameraRecorder: NSObject, ObservableObject {
             }
             // 首次授权那一瞬间麦克风常常还没就绪。在会话「跑起来之前」再补一次，
             // 这时候加输入不会打断任何东西；跑起来之后再动会话才是危险的。
+            //
+            // 一次不成不代表没有：刚授权那几百毫秒里音频设备还在初始化，
+            // AVCaptureDeviceInput 会抛错。老代码只试一次，失败就整场哑掉 ——
+            // 这就是「第一次录的视频没有声音」。这里给 4 次机会、每次隔 120ms，
+            // 最多多等 0.36 秒（只在异常情况才等）。
             if self.audioIn == nil, AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
-                self.session.beginConfiguration()
-                self.addAudioInput()
-                self.session.commitConfiguration()
+                for attempt in 0..<4 {
+                    self.session.beginConfiguration()
+                    let ok = self.addAudioInput()
+                    self.session.commitConfiguration()
+                    if ok { break }
+                    if attempt < 3 { Thread.sleep(forTimeInterval: 0.12) }
+                }
             }
             if !self.session.isRunning {
                 self.session.startRunning()

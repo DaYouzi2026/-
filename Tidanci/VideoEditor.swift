@@ -50,10 +50,24 @@ final class VideoEditor: ObservableObject {
 
     // MARK: - 入口
 
+    /// 只扫气口、不做别的。编辑页点「智能剪辑」后先调它，把结果拿给用户确认，
+    /// 确认完再调 `run(... cutGaps:)` 真正剪。
+    func scanGaps(input: URL, completion: @escaping ([SilenceGap], Double) -> Void) {
+        workQ.async {
+            let asset = AVURLAsset(url: input)
+            let dur = asset.duration.seconds
+            let raw = (try? SilenceCut.detect(input)) ?? []
+            let merged = SilenceCut.merge(raw).filter { $0.length > 0.40 }
+            DispatchQueue.main.async { completion(merged, dur < 0 ? 0 : dur) }
+        }
+    }
+
     func run(input: URL,
              denoise: Bool,
              subtitle: Bool,
-             cutSilence: Bool = false,
+             style: SubtitleStyle = SubtitleStyle(),
+             /// nil = 不剪；空数组 = 用户选择「一处都不剪」；非空 = 就剪这几处
+             cutGaps: [SilenceGap]? = nil,
              completion: @escaping (URL?, String?) -> Void) {
         guard !running else { return }
         running = true
@@ -89,17 +103,18 @@ final class VideoEditor: ObservableObject {
                 }
             }
 
-            // 2) 掐气口
+            // 2) 掐气口：用用户在弹窗里勾好的那几处。
+            //    这里用较低的保命比例（0.15），因为选择权已经在用户手里了。
             var keeps: [CMTimeRange] = []
-            if cutSilence {
+            if let gaps = cutGaps, !gaps.isEmpty {
                 DispatchQueue.main.async {
-                    self.stage = .transcribe
-                    self.statusText = "找气口…"
-                    self.progress = 0.42
+                    self.progress = 0.44
                 }
-                keeps = SilenceCut.plan(newAudio ?? input)
+                keeps = SilenceCut.keepRanges(duration: asset.duration.seconds,
+                                              gaps: gaps,
+                                              minKeepRatio: 0.15)
                 if keeps.isEmpty {
-                    notes.append("没找到明显气口，节奏按原样保留")
+                    notes.append("按选择剪完几乎没内容了，已按原片输出")
                 }
             }
 
@@ -129,7 +144,8 @@ final class VideoEditor: ObservableObject {
                                            vTrack: vTrack,
                                            audio: newAudio,
                                            cues: cues,
-                                           keeps: keeps)
+                                           keeps: keeps,
+                                           style: style)
                 DispatchQueue.main.async {
                     self.stage = .done
                     self.progress = 1
@@ -360,7 +376,8 @@ final class VideoEditor: ObservableObject {
                          vTrack: AVAssetTrack,
                          audio: URL?,
                          cues: [SubtitleCue],
-                         keeps: [CMTimeRange]) throws -> URL {
+                         keeps: [CMTimeRange],
+                         style: SubtitleStyle) throws -> URL {
         let comp = AVMutableComposition()
         let dur = asset.duration
         guard dur.seconds > 0 else { throw Fail(msg: "视频长度不对") }
@@ -447,13 +464,16 @@ final class VideoEditor: ObservableObject {
 
             for c in shown {
                 guard c.end > c.start else { continue }
-                let img = Self.subtitleImage(c.text, size: size)
+                let img = Self.subtitleImage(c.text, size: size, style: style)
                 let layer = CALayer()
                 layer.contents = img.cgImage
                 layer.contentsGravity = .resize
-                // CA 坐标原点在左下，字幕要贴底部，所以 y 取小值；水平居中，别横向拉伸
+                // CA 坐标原点在左下，字幕位置就是「底边离底部多远」。
+                // 位置调得很高时再夹一下，别让多行字幕顶出画面。
+                let y = min(size.height * CGFloat(style.bottomRatio),
+                            max(0, size.height - img.size.height - size.height * 0.02))
                 layer.frame = CGRect(x: (size.width - img.size.width) / 2,
-                                     y: size.height * 0.07,
+                                     y: y,
                                      width: img.size.width,
                                      height: img.size.height)
                 layer.opacity = 0
@@ -500,10 +520,12 @@ final class VideoEditor: ObservableObject {
         return out
     }
 
-    private static func subtitleImage(_ text: String, size: CGSize) -> UIImage {
-        let fontSize = max(15, size.width * 0.050)
-        let font = UIFont.systemFont(ofSize: fontSize, weight: .semibold)
-        let maxW = size.width * 0.86
+    private static func subtitleImage(_ text: String,
+                                      size: CGSize,
+                                      style: SubtitleStyle) -> UIImage {
+        let fontSize = style.fontSize(width: size.width)
+        let font = style.font(width: size.width)
+        let maxW = size.width * 0.88
 
         let para = NSMutableParagraphStyle()
         para.alignment = .center

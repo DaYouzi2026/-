@@ -1,19 +1,40 @@
 import SwiftUI
 import AVKit
 
-/// 作品页点「编辑」进来的后期页：降噪 + 自动字幕，处理完直接存相册。
+/// 作品页点「编辑」进来的后期页：降噪 + 自动字幕 + 掐气口，处理完直接存相册。
 struct EditorView: View {
     @Environment(\.dismiss) private var dismiss
 
     let item: WorkItem
 
     @StateObject private var editor = VideoEditor()
+
+    /// 字幕样式存在本机，下次进来还是上次那套
+    @AppStorage("subtitle.style.v1") private var styleRaw = ""
+
     @State private var denoise = true
     @State private var subtitle = true
     @State private var cutSilence = true
     @State private var result: URL?
     @State private var note: String?
     @State private var player: AVPlayer?
+
+    // 气口：先扫出来 → 弹窗让用户勾 → 再剪
+    @State private var gaps: [SilenceGap] = []
+    @State private var gapDuration: Double = 0
+    @State private var scanning = false
+    @State private var showGaps = false
+
+    private var style: SubtitleStyle { SubtitleStyle.decode(styleRaw) }
+
+    private func setStyle(_ s: SubtitleStyle) {
+        styleRaw = s.clamped().encoded
+    }
+
+    /// 每处气口前后各留 0.12 秒，所以真正能省的是 length - 0.24
+    private var saveable: Double {
+        gaps.reduce(0.0) { $0 + max(0, $1.length - 0.24) }
+    }
 
     var body: some View {
         NavigationStack {
@@ -56,6 +77,31 @@ struct EditorView: View {
                     .disabled(editor.running)
                 }
             }
+            .sheet(isPresented: $showGaps) {
+                GapSheet(duration: gapDuration,
+                         gaps: gaps,
+                         onPreview: { g in
+                             guard let p = player else { return }
+                             p.seek(to: CMTime(seconds: max(0, g.start - 0.9),
+                                               preferredTimescale: 600))
+                             p.play()
+                         },
+                         onCancel: {
+                             showGaps = false
+                         },
+                         onConfirm: { chosen in
+                             showGaps = false
+                             runEdit(cut: chosen)
+                         })
+                    .presentationDetents([.large])
+            }
+            .onAppear {
+                if player == nil { player = AVPlayer(url: item.url) }
+                if cutSilence && gapDuration == 0 { scanGapsOnly() }
+            }
+            .onChange(of: cutSilence) { on in
+                if on && gapDuration == 0 && !scanning { scanGapsOnly() }
+            }
         }
     }
 
@@ -78,10 +124,16 @@ struct EditorView: View {
 
     private var options: some View {
         VStack(spacing: 12) {
-            toggleRow(icon: "scissors",
-                      title: "智能剪辑 · 掐气口",
-                      sub: "自动认出换气、卡壳的停顿并剪掉，成片更紧凑；残留一点呼吸声属于正常",
-                      isOn: $cutSilence)
+            VStack(spacing: 8) {
+                toggleRow(icon: "scissors",
+                          title: "智能剪辑 · 掐气口",
+                          sub: "自动认出换气、卡壳的停顿，处理后先列出来给你挑，再动手剪",
+                          isOn: $cutSilence)
+
+                if cutSilence {
+                    gapRow
+                }
+            }
 
             toggleRow(icon: "waveform",
                       title: "AI 降噪",
@@ -90,8 +142,12 @@ struct EditorView: View {
 
             toggleRow(icon: "text.bubble",
                       title: "自动字幕",
-                      sub: "识别口播内容，烧进画面底部。耗时最长，一般等于视频长度的一半",
+                      sub: "识别口播内容，烧进画面。耗时最长，一般等于视频长度的一半",
                       isOn: $subtitle)
+
+            if subtitle {
+                subtitleStyleCard
+            }
 
             Text("原视频不会被改动，处理结果会另存一份到相册。")
                 .font(.system(size: 11))
@@ -99,6 +155,169 @@ struct EditorView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 4)
         }
+    }
+
+    /// 气口扫描结果那一行：能看到找到几处、能省多久，也能点开重新挑
+    private var gapRow: some View {
+        HStack(spacing: 8) {
+            if scanning {
+                ProgressView().scaleEffect(0.7)
+                Text("正在找气口…")
+                    .font(.system(size: 11))
+                    .foregroundColor(T.sub)
+                Spacer()
+            } else if gaps.isEmpty {
+                Image(systemName: "waveform.slash")
+                    .font(.system(size: 12))
+                    .foregroundColor(T.sub)
+                Text(gapDuration > 0 ? "没找到明显气口，节奏按原样保留" : "还没扫描")
+                    .font(.system(size: 11))
+                    .foregroundColor(T.sub)
+                Spacer()
+                if gapDuration == 0 {
+                    Button("先扫一遍") { scanGapsOnly() }
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(T.accent)
+                }
+            } else {
+                Image(systemName: "list.number")
+                    .font(.system(size: 12))
+                    .foregroundColor(T.accent)
+                Text("找到 \(gaps.count) 处，可省 \(Int(saveable.rounded())) 秒")
+                    .font(.system(size: 11))
+                    .foregroundColor(T.ink2)
+                Spacer()
+                Button("逐处挑选") { showGaps = true }
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(T.accent)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.bottom, 4)
+    }
+
+    // MARK: - 字幕样式
+
+    private var subtitleStyleCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("字幕样式")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(T.ink)
+                Spacer()
+                Text("\(style.positionName) · \(String(format: "%.1f%%", style.sizeRatio * 100))")
+                    .font(.system(size: 11))
+                    .foregroundColor(T.sub)
+            }
+
+            // 字体
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(SubtitleStyle.usable) { o in
+                        let on = style.fontKey == o.id
+                        Button {
+                            var s = style
+                            s.fontKey = o.id
+                            setStyle(s)
+                        } label: {
+                            Text(o.title)
+                                .font(Font(SubtitleStyle(fontKey: o.id,
+                                                         sizeRatio: style.sizeRatio,
+                                                         bottomRatio: style.bottomRatio)
+                                            .uiFont(size: 15)))
+                                .foregroundColor(on ? .white : T.ink2)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .background(on ? T.accent : T.surface2)
+                                .clipShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+
+            // 字号
+            HStack(spacing: 10) {
+                Text("字号")
+                    .font(.system(size: 12))
+                    .foregroundColor(T.ink2)
+                    .frame(width: 30, alignment: .leading)
+                Text("小")
+                    .font(.system(size: 10))
+                    .foregroundColor(T.sub)
+                Slider(value: Binding(
+                    get: { style.sizeRatio },
+                    set: { v in
+                        var s = style
+                        s.sizeRatio = v
+                        setStyle(s)
+                    }
+                ), in: 0.028...0.10)
+                .tint(T.accent)
+                Text("大")
+                    .font(.system(size: 10))
+                    .foregroundColor(T.sub)
+            }
+
+            // 位置
+            HStack(spacing: 10) {
+                Text("位置")
+                    .font(.system(size: 12))
+                    .foregroundColor(T.ink2)
+                    .frame(width: 30, alignment: .leading)
+                Text("底")
+                    .font(.system(size: 10))
+                    .foregroundColor(T.sub)
+                Slider(value: Binding(
+                    get: { style.bottomRatio },
+                    set: { v in
+                        var s = style
+                        s.bottomRatio = v
+                        setStyle(s)
+                    }
+                ), in: 0.02...0.80)
+                .tint(T.accent)
+                Text("顶")
+                    .font(.system(size: 10))
+                    .foregroundColor(T.sub)
+            }
+
+            HStack(spacing: 8) {
+                ForEach([0.07, 0.45, 0.74], id: \.self) { v in
+                    let name = v < 0.2 ? "底部" : (v < 0.6 ? "居中" : "靠上")
+                    Button {
+                        var s = style
+                        s.bottomRatio = v
+                        setStyle(s)
+                    } label: {
+                        Text(name)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(abs(style.bottomRatio - v) < 0.02 ? .white : T.ink2)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 7)
+                            .background(abs(style.bottomRatio - v) < 0.02 ? T.accent : T.surface2)
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            // 小样：按画面比例缩放预览，不用真导出一遍才知道效果
+            SubtitleSample(style: style, text: "大家好，今天聊三件事")
+                .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(T.line, lineWidth: 1)
+                )
+        }
+        .padding(14)
+        .background(T.surface)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(T.line, lineWidth: 1)
+        )
     }
 
     private func toggleRow(icon: String,
@@ -233,35 +452,78 @@ struct EditorView: View {
             }
         } label: {
             HStack(spacing: 8) {
-                if editor.running {
+                if editor.running || scanning {
                     ProgressView()
                         .tint(.white)
                         .scaleEffect(0.8)
                 }
-                Text(result != nil ? "完成" : (editor.running ? "处理中…" : "开始处理"))
+                Text(buttonTitle)
                     .font(.system(size: 15, weight: .semibold))
             }
             .foregroundColor(.white)
             .frame(maxWidth: .infinity)
             .padding(.vertical, 15)
-            .background(editor.running ? T.sub : T.accent)
+            .background(editor.running || scanning ? T.sub : T.accent)
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
-        .disabled(editor.running)
+        .disabled(editor.running || scanning)
         .pressable()
     }
 
+    private var buttonTitle: String {
+        if result != nil { return "完成" }
+        if editor.running { return "处理中…" }
+        if scanning { return "找气口…" }
+        return "开始处理"
+    }
+
+    // MARK: - 流程
+
+    private func scanGapsOnly() {
+        guard !scanning else { return }
+        scanning = true
+        editor.scanGaps(input: item.url) { g, d in
+            scanning = false
+            gaps = g
+            gapDuration = d
+        }
+    }
+
     private func start() {
-        guard !editor.running else { return }
+        guard !editor.running, !scanning else { return }
         result = nil
         note = nil
         player?.pause()
-        player = nil
+
+        guard cutSilence else {
+            runEdit(cut: [])
+            return
+        }
+
+        // 开着智能剪辑：先确保扫过，再把结果摆到用户面前挑
+        if gapDuration <= 0 {
+            scanning = true
+            editor.scanGaps(input: item.url) { g, d in
+                scanning = false
+                gaps = g
+                gapDuration = d
+                showGaps = true
+            }
+            return
+        }
+        showGaps = true
+    }
+
+    private func runEdit(cut: [SilenceGap]) {
+        result = nil
+        note = nil
+        player?.pause()
 
         editor.run(input: item.url,
                    denoise: denoise,
                    subtitle: subtitle,
-                   cutSilence: cutSilence) { url, err in
+                   style: style,
+                   cutGaps: cutSilence ? cut : nil) { url, err in
             if let u = url {
                 result = u
                 player = AVPlayer(url: u)

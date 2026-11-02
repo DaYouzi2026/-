@@ -143,14 +143,9 @@ enum SilenceCut {
 
     // MARK: - 保留片段
 
-    /// 把气口换算成「要保留的片段」。每个气口前后各留 pad 秒，避免把字头字尾咬掉。
-    /// 返回空数组 = 不建议剪（没气口、或者素材本来就很干净）。
-    static func keepRanges(duration: Double,
-                           gaps: [SilenceGap],
-                           pad: Double = 0.12) -> [CMTimeRange] {
-        guard duration > 0.8, !gaps.isEmpty else { return [] }
-
-        // 合并挨得很近的气口：说话中间换气会被切成两段，分开处理会把字也剪掉
+    /// 合并挨得很近的气口：说话中间换气会被切成两段，分开处理会把字也剪掉。
+    /// 弹窗列表也用合并后的结果，这样「看到几处」和「实际剪几处」是同一份数据。
+    static func merge(_ gaps: [SilenceGap]) -> [SilenceGap] {
         var merged: [SilenceGap] = []
         for g in gaps.sorted(by: { $0.start < $1.start }) {
             if var last = merged.last, g.start - last.end < 0.18 {
@@ -160,6 +155,22 @@ enum SilenceCut {
                 merged.append(g)
             }
         }
+        return merged
+    }
+
+    /// 把气口换算成「要保留的片段」。每个气口前后各留 pad 秒，避免把字头字尾咬掉。
+    /// 返回空数组 = 不建议剪（没气口、或者素材本来就很干净）。
+    ///
+    /// - Parameter minKeepRatio: 保留内容低于原片这个比例就放弃剪辑。
+    ///   自动剪的时候用 0.4（阈值可能把说话误判成静音，宁可不剪）；
+    ///   用户在弹窗里亲手选过之后用 0.15（他自己看过时间点了，尊重选择，但仍留一道保命线）。
+    static func keepRanges(duration: Double,
+                           gaps: [SilenceGap],
+                           pad: Double = 0.12,
+                           minKeepRatio: Double = 0.4) -> [CMTimeRange] {
+        guard duration > 0.8, !gaps.isEmpty else { return [] }
+
+        let merged = merge(gaps)
 
         var keeps: [CMTimeRange] = []
         var cursor = 0.0
@@ -173,7 +184,7 @@ enum SilenceCut {
 
         let kept = keeps.reduce(0.0) { $0 + $1.duration.seconds }
         // 剪掉太多说明阈值把说话也当静音了，宁可不动
-        if keeps.isEmpty || kept < duration * 0.4 { return [] }
+        if keeps.isEmpty || kept < duration * minKeepRatio { return [] }
         return keeps
     }
 
