@@ -4,6 +4,7 @@ import UIKit
 import Speech
 import CoreMedia
 import AVFAudio
+import AudioToolbox
 
 /// 一条字幕
 struct SubtitleCue {
@@ -192,7 +193,16 @@ final class VideoEditor: ObservableObject {
         let engine = AVAudioEngine()
         let player = AVAudioPlayerNode()
         let eq = AVAudioUnitEQ(numberOfBands: 1)
-        let dyn = AVAudioUnitDynamicsProcessor()
+        // AVFoundation 里**没有** AVAudioUnitDynamicsProcessor 这个类（第一次编译就栽在这），
+        // 动态处理器只能按 AudioComponent 描述去要，参数也走 AudioUnitSetParameter。
+        let dynDesc = AudioComponentDescription(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: kAudioUnitSubType_DynamicsProcessor,
+            componentManufacturer: kAudioUnitManufacturer_Apple,
+            componentFlags: 0,
+            componentFlagsMask: 0
+        )
+        let dyn = AVAudioUnitEffect(audioComponentDescription: dynDesc)
 
         engine.attach(player)
         engine.attach(eq)
@@ -210,14 +220,16 @@ final class VideoEditor: ObservableObject {
         eq.bands[0].bandwidth = 0.5
         eq.bands[0].bypass = false
 
-        // 阈值以下继续往下压，等于一个温和的噪声门
-        dyn.threshold = -22
-        dyn.headRoom = 0.5
-        dyn.expansionRatio = 2.8
-        dyn.expansionThreshold = -46
-        dyn.attackTime = 0.002
-        dyn.releaseTime = 0.06
-        dyn.masterGain = 1.5
+        // 阈值以下继续往下压，等于一个温和的噪声门。
+        // 注意单位：threshold/headRoom/expansionThreshold/masterGain 是 dB，
+        // expansionRatio 是倍数，attack/release 是秒。
+        Self.param(dyn, kDynamicsProcessorParam_Threshold, -22)
+        Self.param(dyn, kDynamicsProcessorParam_HeadRoom, 0.5)
+        Self.param(dyn, kDynamicsProcessorParam_ExpansionRatio, 2.8)
+        Self.param(dyn, kDynamicsProcessorParam_ExpansionThreshold, -46)
+        Self.param(dyn, kDynamicsProcessorParam_AttackTime, 0.002)
+        Self.param(dyn, kDynamicsProcessorParam_ReleaseTime, 0.06)
+        Self.param(dyn, kDynamicsProcessorParam_MasterGain, 1.5)
 
         let file = try AVAudioFile(forWriting: out, settings: format.settings)
 
@@ -476,6 +488,11 @@ final class VideoEditor: ObservableObject {
     }
 
     // MARK: - 工具
+
+    /// 给 AudioUnit 设一个参数，失败就算了（不同系统版本参数 id 略有差异，不值得为此中断导出）
+    private static func param(_ unit: AVAudioUnit, _ id: AudioUnitParameterID, _ v: Float) {
+        AudioUnitSetParameter(unit.audioUnit, id, kAudioUnitScope_Global, 0, v, 0)
+    }
 
     private static func temp(_ name: String) -> URL {
         let dir = FileManager.default.temporaryDirectory
