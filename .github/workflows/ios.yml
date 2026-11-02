@@ -30,7 +30,17 @@ jobs:
           xcodegen --version
 
       - name: 生成 Xcode 工程
-        run: xcodegen generate
+        run: |
+          xcodegen generate
+          # 兜底：xcodegen 一旦不认 options.xcodeVersion，还是会写成 Xcode 16 的
+          # objectVersion 77，15.4 就打不开。这里强制降回 56 并打印结果。
+          PBX=Tidanci.xcodeproj/project.pbxproj
+          if grep -q "objectVersion = 77;" "$PBX"; then
+            sed -i '' 's/objectVersion = 77;/objectVersion = 56;/' "$PBX"
+            sed -i '' '/preferredProjectObjectVersion/d' "$PBX"
+          fi
+          grep -m1 "objectVersion" "$PBX"
+          xcodebuild -version
 
       - name: 编译（不签名）
         run: |

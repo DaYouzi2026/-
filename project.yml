@@ -1,6 +1,10 @@
 name: Tidanci
 options:
   bundleIdPrefix: com.workbuddy
+  # 卡死过一次：macos-14 上只有 Xcode 15.4，而最新 xcodegen 默认按 Xcode 16
+  # 的 objectVersion 77 写工程文件，15.4 直接报 "future Xcode project file format"。
+  # 显式声明用 15.4 生成，让它落到老格式。
+  xcodeVersion: "15.4"
   deploymentTarget:
     iOS: "16.0"
   createIntermediateGroups: true
