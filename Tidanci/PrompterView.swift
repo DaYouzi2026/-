@@ -948,9 +948,9 @@ struct BeautyPanel: View {
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundColor(T.sub)
                     Spacer()
-                    Text("整幅画面柔化")
+                    Text("锁定面部")
                         .font(.system(size: 10))
-                        .foregroundColor(T.sub)
+                        .foregroundColor(T.accent)
                 }
 
                 bar("磨皮", $smooth)
@@ -962,9 +962,9 @@ struct BeautyPanel: View {
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundColor(T.sub)
                     Spacer()
-                    Text("固定区域 · 需正对镜头")
+                    Text("跟随人脸")
                         .font(.system(size: 10))
-                        .foregroundColor(T.warn)
+                        .foregroundColor(T.accent)
                 }
                 .padding(.top, 6)
 
@@ -989,7 +989,7 @@ struct BeautyPanel: View {
 
     private var noteText: String {
         if !on { return "美颜关着，拍的是原相机画面，可用 4K" }
-        return "磨皮和美白作用于整个画面，人和背景一起柔化。瘦脸大眼没有做人脸识别，是按画面固定区域算的，歪头或不在中间就对不上。美颜最高 1080P，要 4K 请切回原相机。"
+        return "磨皮、美白、红润只作用在脸上，头发、衣服、背景不受影响。瘦脸沿真实脸颊轮廓收，大眼锁住瞳孔位置，歪头、靠近、退远都跟得住。镜头里没有人脸时会退回整幅处理。美颜最高 1080P，要 4K 请切回原相机。"
     }
 
     private var filterStrip: some View {

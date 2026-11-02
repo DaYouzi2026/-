@@ -424,7 +424,8 @@ final class CameraRecorder: NSObject, ObservableObject {
             img = img.oriented(.right)
             dims = CGSize(width: h, height: w)
         }
-        let out = BeautyPipeline.shared.process(img, dims: dims)
+        let face = BeautyPipeline.shared.tracker.geometry(pixel: px, rotate: needRotate)
+        let out = BeautyPipeline.shared.process(img, dims: dims, face: face)
 
         if let buf = previewBuffer(dims) {
             BeautyPipeline.shared.render(out, into: buf)
