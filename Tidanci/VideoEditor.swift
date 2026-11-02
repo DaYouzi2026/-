@@ -229,7 +229,7 @@ final class VideoEditor: ObservableObject {
         Self.param(dyn, kDynamicsProcessorParam_ExpansionThreshold, -46)
         Self.param(dyn, kDynamicsProcessorParam_AttackTime, 0.002)
         Self.param(dyn, kDynamicsProcessorParam_ReleaseTime, 0.06)
-        Self.param(dyn, kDynamicsProcessorParam_MasterGain, 1.5)
+        Self.param(dyn, kDynamicsProcessorParam_OverallGain, 1.5)
 
         let file = try AVAudioFile(forWriting: out, settings: format.settings)
 
