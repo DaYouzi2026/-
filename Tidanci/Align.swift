@@ -4,7 +4,6 @@ import Combine
 // MARK: - 拼音
 
 /// 用系统自带的 CFStringTransform 取拼音，不需要外部数据表。
-/// iOS 这套（kCFStringTransformMandarinLatin）比我们自己塞个 77KB 的表省事得多。
 enum Py {
     private static var cache: [Character: [String]] = [:]
 
@@ -38,7 +37,7 @@ enum Py {
         return ("", syl)
     }
 
-    /// 容易混的声母分组，同组按「打折」处理（平翘舌、n/l、f/h、b/p、d/t、g/k）
+    /// 容易混的声母分组（平翘舌、n/l、f/h、b/p、d/t、g/k）
     static func group(_ ini: String) -> Int {
         switch ini {
         case "zh", "z", "j": return 1
@@ -54,7 +53,6 @@ enum Py {
         }
     }
 
-    /// 去掉前后鼻音尾巴，用于「不完全一样但很接近」的判断
     static func stem(_ fin: String) -> String {
         if fin.hasSuffix("ng") { return String(fin.dropLast(2)) }
         if fin.hasSuffix("n") { return String(fin.dropLast()) }
@@ -92,22 +90,33 @@ struct PreparedScript {
     let offsets: [Int]
     /// 每个字的全部读音（多音字会有多个）
     let pinyins: [[String]]
+    /// 每个自然句在 norm 里的起始下标
+    let sentenceStarts: [Int]
 
     init(text: String) {
         self.text = text
         var n: [Character] = []
         var o: [Int] = []
+        var starts: [Int] = []
+        var pending = true
         var i16 = 0
         for ch in text {
             if PreparedScript.keep(ch) {
+                if pending {
+                    starts.append(n.count)
+                    pending = false
+                }
                 n.append(ch)
                 o.append(i16)
+            } else if PreparedScript.isBreak(ch) {
+                pending = true
             }
             i16 += String(ch).utf16.count
         }
         norm = n
         offsets = o
         pinyins = n.map { Py.syllables($0) }
+        sentenceStarts = starts
     }
 
     static func keep(_ c: Character) -> Bool {
@@ -121,6 +130,11 @@ struct PreparedScript {
         return false
     }
 
+    /// 句读符号，用来断句
+    static func isBreak(_ c: Character) -> Bool {
+        return "。！？!?；;\n\r，,".contains(c)
+    }
+
     var isEmpty: Bool { norm.isEmpty }
 }
 
@@ -128,9 +142,13 @@ struct PreparedScript {
 
 /// 台本约束下的模糊对齐。
 ///
-/// 和安卓版同一套思路：把识别结果当成「可能有错的读音串」，在游标附近的台本上做
-/// 自由起点编辑距离，插入 / 漏字 / 同音字都只算半个字的代价。
-/// 所以「读完了画面不动」这种硬卡死不会被一个字写错触发。
+/// 三条通道，从强到弱：
+/// 1. **句子锚点**：用户跳到下一句时，直接按句首比对，命中就整段跳过去
+/// 2. **模糊对齐**：自由起点编辑距离，同音容错，插入漏字只算半价
+/// 3. **短探针**：只说了两三个关键词时，在游标附近小范围找
+///
+/// 关键修改（v1.6）：跳远不再压缩通过门槛。旧逻辑跳超过 35 字时门槛只剩 0.153，
+/// 意味着每个字都必须完全同音才能跳，于是「读到下一句但不动」几乎必然发生。
 final class Follower {
     private let script: PreparedScript
     private(set) var cursor = 0
@@ -141,16 +159,17 @@ final class Follower {
     private var lastMatchAt = Date()
     private(set) var lastScore: Float = 1
 
-    private let GAP = 55
+    /// 插入 / 漏一个字的代价。旧值 55 太贵，用户自由发挥几句就超预算
+    private let GAP = 45
 
     init(_ s: PreparedScript) {
         script = s
     }
 
     private func thFor(_ k: Int) -> Float {
-        if k >= 16 { return 0.34 }
-        if k >= 10 { return 0.40 }
-        return 0.46
+        if k >= 16 { return 0.38 }
+        if k >= 10 { return 0.44 }
+        return 0.52
     }
 
     func advance(_ spRaw: [Character]) -> Int {
@@ -158,52 +177,53 @@ final class Follower {
         guard n > 0 else { return 0 }
         let sp = spRaw
         let m = sp.count
-        guard m >= 3 else { return cursor }
+        guard m >= 2 else { return cursor }
         if cursor >= n - 1 { return cursor }
 
-        var win = 96
-        if stall >= 6 { win = 200 }
-        if stall >= 14 { win = 480 }
-        if stall >= 24 { win = 1200 }
-
-        // 发音串只算一次，DP 里反复用
         let spPy: [[String]] = sp.map { Py.syllables($0) }
+
+        // 通道 3：只说了两三个字，在游标附近小范围找
+        if m <= 3, let e = shortProbe(sp, spPy) {
+            return commit(e, m)
+        }
+
+        guard m >= 4 else { return cursor }
+
+        // 通道 1：跳到句子开头。用户跳读、跳句时主要靠这条
+        if let e = sentenceJump(sp, spPy) {
+            return commit(e, m)
+        }
+
+        // 通道 2：常规模糊对齐
+        var win = 120
+        if stall >= 6 { win = 240 }
+        if stall >= 14 { win = 520 }
+        if stall >= 24 { win = 1000 }
 
         var e = -1
         if m >= 8 {
             let k = min(16, m)
             e = best(sp, spPy, k, cursor, win, thFor(k))
         }
-        if e < 0 && m >= 8 && stall >= 2 {
-            e = best(sp, spPy, 8, cursor, min(win, 90), 0.40)
+        if e < 0 && m >= 8 {
+            e = best(sp, spPy, 8, cursor, min(win, 120), 0.42)
         }
         if e < 0 && m >= 4 {
-            e = best(sp, spPy, min(6, m), cursor, 24, 0.22)
+            e = best(sp, spPy, min(6, m), cursor, 60, 0.26)
         }
 
-        if e >= 0 && e != cursor {
-            let jump = e - cursor
-            // 往前跳：随便；往回纠：最多 40 字，别乱翻页
-            if jump > 0 || -jump <= 40 {
-                cursor = e
-                stall = 0
-                creeped = 0
-                lastMatchAt = Date()
-                lastSpokenLen = m
-                return cursor
-            }
-        }
+        if e >= 0 { return commit(e, m) }
 
         stall += 1
-        // 一直在说但一直没对上（口音重 / 环境吵）：按语速慢慢蠕，别让画面僵死
-        if stall >= 8 && creeped < 14 && cursor < n - 3
-            && Date().timeIntervalSince(lastMatchAt) > 2.0
+        // 一直在说但一直没对上：按语速慢慢蠕，别让画面僵死。
+        // 每次只走一个字，走多了会把游标带偏，反而更难对上
+        if stall >= 10 && creeped < 10 && cursor < n - 3
+            && Date().timeIntervalSince(lastMatchAt) > 2.5
             && m > lastSpokenLen {
-            let add = min(2, m - lastSpokenLen)
-            cursor += add
-            creeped += add
+            cursor += 1
+            creeped += 1
             lastMatchAt = Date()
-            stall = 4
+            stall = 6
             lastSpokenLen = m
             return cursor
         }
@@ -211,7 +231,97 @@ final class Follower {
         return cursor
     }
 
-    /// 自由起点编辑距离，返回最合适的「结束位置」，找不到返回 -1
+    /// 统一收口：判断这一跳是否合理
+    private func commit(_ e: Int, _ m: Int) -> Int {
+        lastSpokenLen = m
+        if e == cursor { return cursor }
+        let jump = e - cursor
+        // 往前跳：随便；往回纠：最多 40 字，别乱翻页
+        if jump > 0 || -jump <= 40 {
+            cursor = e
+            stall = 0
+            creeped = 0
+            lastMatchAt = Date()
+            return cursor
+        }
+        return cursor
+    }
+
+    // MARK: 通道 1 · 句子锚点
+
+    /// 在游标之后 500 字内，找开头最像的这一句，命中就返回它的起始位置。
+    /// 只往前找，不会往回跳。
+    private func sentenceJump(_ sp: [Character], _ spPy: [[String]]) -> Int? {
+        let n = script.norm.count
+        let starts = script.sentenceStarts
+        guard !starts.isEmpty, sp.count >= 5 else { return nil }
+
+        let probe = min(6, sp.count)
+        let qs = sp.count - probe
+
+        var bestI = -1
+        var bestScore = 0.0
+
+        for s in starts {
+            if s <= cursor + 2 { continue }
+            if s - cursor > 500 { break }
+            if s + probe > n { continue }
+
+            var hit = 0
+            for t in 0..<probe {
+                let c = sp[qs + t]
+                if c == script.norm[s + t] {
+                    hit += 2
+                } else if let a = spPy[qs + t].first,
+                          let b = script.pinyins[s + t].first,
+                          Py.sylCost(a, b) <= 45 {
+                    hit += 1
+                }
+            }
+            let score = Double(hit) / Double(probe * 2)
+            if score >= 0.70 && score > bestScore {
+                bestScore = score
+                bestI = s
+            }
+        }
+        return bestI >= 0 ? bestI : nil
+    }
+
+    // MARK: 通道 3 · 短探针
+
+    /// 只说了两三个字时，在游标之后 14 字内找完全同音的位置。
+    /// 只往前走，避免因为一个常用词把游标拽回去。
+    private func shortProbe(_ sp: [Character], _ spPy: [[String]]) -> Int? {
+        let n = script.norm.count
+        let len = sp.count
+        guard len >= 2, cursor + len <= n else { return nil }
+
+        let lo = cursor
+        let hi = min(n - len, cursor + 14)
+        if hi < lo { return nil }
+
+        var i = lo
+        while i <= hi {
+            var ok = true
+            for t in 0..<len {
+                let c = sp[t]
+                let d = script.norm[i + t]
+                if c == d { continue }
+                guard let a = spPy[t].first,
+                      let b = script.pinyins[i + t].first,
+                      Py.sylCost(a, b) <= 28 else {
+                    ok = false
+                    break
+                }
+            }
+            if ok { return i + len }
+            i += 1
+        }
+        return nil
+    }
+
+    // MARK: 通道 2 · 自由起点编辑距离
+
     private func best(_ sp: [Character],
                       _ spPy: [[String]],
                       _ k: Int,
@@ -220,7 +330,6 @@ final class Follower {
                       _ th: Float) -> Int {
         let n = script.norm.count
         let qs = max(0, sp.count - k)
-        // 起点要能退到「一个完整探针之前」，否则这次朗读的开头几个字永远对不上
         let lo = max(0, after - k - 4)
         let hi = min(n, after + win)
         if hi - lo < k { return -1 }
@@ -276,15 +385,16 @@ final class Follower {
             if i != after {
                 let raw = Float(row[k]) / (100.0 * Float(k))
                 let jump = i - after
+                // 远处的候选只做轻度降权，不再是「几乎不可能通过」
                 let limit: Float
                 if jump > 0 {
-                    limit = jump <= 10 ? th : (jump <= 35 ? th * 0.75 : th * 0.45)
+                    limit = jump <= 10 ? th : (jump <= 35 ? th * 0.85 : th * 0.70)
                 } else {
-                    limit = th * 0.28
+                    limit = th * 0.45
                 }
                 if raw <= limit {
                     var rank = raw
-                    if jump > 0 { rank += min(0.12, 0.0012 * Float(jump)) }
+                    if jump > 0 { rank += min(0.10, 0.0009 * Float(jump)) }
                     if rank < bestRank {
                         bestRank = rank
                         bestI = i
