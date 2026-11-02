@@ -190,12 +190,16 @@ final class Follower {
     private var ins: [Int] = []
     private var prevIns: [Int] = []
 
+    /// 句子起点，构造时取一次。别写成计算属性——每个候选位置都会查一次，
+    /// 计算属性会每次都复制一遍数组，直接把这个函数拖成性能瓶颈。
+    private let heads: [Int]
+
     init(_ s: PreparedScript) {
         script = s
+        heads = s.sentenceStarts
     }
 
     private var n: Int { script.norm.count }
-    private var starts: [Int] { script.sentenceStarts }
 
     // MARK: 门槛
 
@@ -253,7 +257,7 @@ final class Follower {
 
     /// 这个位置是不是（或紧挨着）某个句子的开头。二分查找，句子起点是升序的
     private func nearSentenceStart(_ i: Int, _ tol: Int) -> Bool {
-        let s = starts
+        let s = heads
         guard !s.isEmpty else { return false }
         var lo = 0, hi = s.count - 1
         while lo <= hi {
