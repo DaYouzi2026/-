@@ -149,7 +149,10 @@ final class SpeechFollower: ObservableObject {
         request = nil
         task = nil
         lock.unlock()
-        old?.cancel()                 // 它的回调因为 gen 变了会被丢弃，不会再来重开
+        // 用 finish 而不是 cancel：cancel 会让识别器立刻收摊，顺手把音频会话也放掉，
+        // 相机那一路采集就跟着断了——这正是「录三秒还有声、录久了就没声」的现场。
+        // finish 是温和收尾，音频资源不会当场被回收。
+        old?.finish()
 
         let r = SFSpeechAudioBufferRecognitionRequest()
         r.shouldReportPartialResults = true
@@ -211,15 +214,42 @@ final class SpeechFollower: ObservableObject {
         lock.lock()
         task = t
         lock.unlock()
+
+        // 录制中重开识别：给它 0.2 秒落定，再把音频路由抢回「录视频」那一套。
+        // 不做这一步的话，识别每说完一句就把会话带偏一次，相机的麦克风再也回不来。
+        if AudioSession.cameraBusy {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                guard self?.wantRun == true, AudioSession.cameraBusy else { return }
+                AudioSession.enforceForCamera()
+            }
+        }
     }
 
     /// 新请求刚开头的两三个字，前面补上上一句的尾巴，凑够能被信任的探针长度。
     /// 一旦这一句自己长到六个字以上，就不需要拐杖了，果断丢掉。
+    ///
+    /// v1.13：重开请求时识别器偶尔会先把上一句的尾巴再吐一遍，拼起来就是
+    /// 「今天我们来聊」+「聊今天我们来聊」这种重复片段。对齐那边看到两遍同样的字，
+    /// 会以为人已经念到下一处相同的话了，位置就飘了。这里把重复的头砍掉。
     private func composed(_ text: String) -> String {
         if carry.isEmpty { return text }
-        let kept = text.filter { PreparedScript.keep($0) }
-        if kept.count >= 6 { return text }
-        return carry + text
+        var kept = String(text.filter { PreparedScript.keep($0) })
+
+        let c = Array(carry)
+        var overlap = 0
+        var len = min(c.count, kept.count)
+        while len >= 3 {
+            if Array(c.suffix(len)) == Array(kept.prefix(len)) {
+                overlap = len
+                break
+            }
+            len -= 1
+        }
+        if overlap > 0 { kept = String(kept.dropFirst(overlap)) }
+
+        if kept.count >= 6 { return kept }
+        if kept.isEmpty { return carry }
+        return carry + kept
     }
 
     private func handle(_ e: NSError, rec: SFSpeechRecognizer) {

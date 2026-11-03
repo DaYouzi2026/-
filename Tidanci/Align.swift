@@ -201,12 +201,35 @@ final class Follower {
     private(set) var lastScore: Float = 1
     private(set) var lastStep = 0
 
+    /// 最近一次大步前进（>40 字）的时刻。两秒半之内再来一次大步前进就不认——
+    /// 连续两跳说明它是在「顺着重复的字往下滑」，不是在跟着人念。
+    private var bigJumpAt = Date.distantPast
+    /// 大步跳转之前的游标。跳过去以后连着十几帧读不上，就退回这里。
+    private var jumpBack: Int? = nil
+    /// 这一跳落在哪儿。五秒后如果只从落点往前挪了不到十五个字，就判定跳错了。
+    private var jumpTo = 0
+    private var jumpBackDeadline = Date.distantPast
+
     /// 插入 / 漏一个字的代价
     private let GAP = 45
     /// 算「连成串」时允许的读音差：只认同音和极近音
     private let GOOD = 32
     /// 往回找多远：够覆盖一到两句，重读上一句能拉回来
     private let BACK = 240
+
+    /// ── v1.13：跨度硬上限 ─────────────────────────────────────
+    /// 「识别乱跑、直接跑到文末」的机器原因：窗口在卡住时会一路放大到 1000 字，
+    /// 而「末尾连续对上 7 个字」这条无条件放行，于是台本里任何一处重复的句子
+    /// （口号、产品名、开场白）都能把光标一次性拽出几百字。到那儿以后再念原文
+    /// 也对不上，只能关掉重来。
+    ///
+    /// 现在给「一次最多挪多远」定死：
+    ///   - 普通情况一步不超过 90 字（约两句）；
+    ///   - 只有整句原样念出来（末尾连续 9 字以上全同音 + 落在句首）才允许 300 字，
+    ///     这是给「跳到下一段接着读」留的口子；
+    ///   - 超过 300 字一律不认——那已经不是跟读，是跑飞了。
+    private let MAX_STEP = 90
+    private let MAX_STEP_FAR = 300
 
     private var d: [Int] = []
     private var prev: [Int] = []
@@ -246,11 +269,17 @@ final class Follower {
         let dist = abs(jump)
         let th = thFor(eff)
 
+        // 第零道：跨度硬上限。这一道排在所有「放行」之前——哪怕是整句全对上了，
+        // 也不许一步跳到几百字以外。少了它，台本里重复的开场白就会把画面甩到文末。
+        if dist > MAX_STEP_FAR { return false }
+
         // 硬证据：末尾连续对上 5 个字以上。识别器可能把前面一截听成乱码，
         // 但「刚说出口的这几个字」它几乎不会错——比平均代价可靠得多。
         // 少了这两条，光标一落后十几格就再也追不回来（就是「读了不翻页」）。
         if runLen >= 5 && dist <= 24 { return true }
-        if runLen >= 7 { return true }
+        // 原来这里是「runLen >= 7 无条件放行」：7 个字全同音确实很硬，但台本里
+        // 「大家好，我是XXX」这种重复句照样能全中，于是它成了乱跑的主要出口。
+        if runLen >= 7 && dist <= 60 { return true }
         // 命中率高：十几个字里有四分之三同音，位置基本不会错
         if eff >= 8 && good >= (eff * 3) / 4 && dist <= 16 { return true }
 
@@ -260,13 +289,14 @@ final class Follower {
         if eff <= 3 { maxD = 3 }
         else if eff <= 5 { maxD = 8 }
         else if eff <= 7 { maxD = 20 }
-        else if eff <= 9 { maxD = 60 }
-        else { maxD = Int.max }
+        else if eff <= 9 { maxD = 45 }
+        else { maxD = MAX_STEP }
 
         // 只念关键词时探针天然短（「不会取代人」五个字），但它是原样念出来的：
         // 读音几乎全中且连成串，这种可以跳远。随口说的话串不起来。
+        // 原来这里直接放成 Int.max，等于给「重复短句」开了一条通往文末的路。
         if dist > maxD && eff >= 4 && raw <= 0.12 && runLen >= eff {
-            maxD = Int.max
+            maxD = runLen >= 9 ? MAX_STEP_FAR : MAX_STEP
         }
         if dist > maxD { return false }
 
@@ -276,19 +306,25 @@ final class Follower {
             // 跳读是从下一句的开头读起的，所以对齐的**起点**应该落在句首。
             // 不能只看终点：念了 6 个字，终点就在句首后面 6 个字
             let end = jump + cursor
-            if nearSentenceStart(end, 3) || nearSentenceStart(end - eff, 4) {
-                return raw <= th * 0.66
+            let onHead = nearSentenceStart(end, 3) || nearSentenceStart(end - eff, 4)
+            if dist <= MAX_STEP {
+                if onHead { return raw <= th * 0.62 }
+                return raw <= th * 0.38 && runLen >= min(4, eff)
             }
-            return raw <= th * 0.38 && runLen >= min(4, eff)
+            // 走到这儿说明跨度超过了两句：必须整句原样念出来，而且正好落在句首。
+            // 「跳读」在真机上长这样——用户看着稿子从下一段开头念，尾音是完整的。
+            return onHead && runLen >= 9 && raw <= th * 0.34
         }
         if dist <= 20 { return raw <= th * 0.92 }
         return raw <= th * 0.78
     }
 
-    /// 同样准的情况下优先离得近的，避免撞上重复句子时一下跳到后面
+    /// 同样准的情况下优先离得近的，避免撞上重复句子时一下跳到后面。
+    /// 惩罚随距离开方增长：30 字约 0.05、90 字约 0.09、250 字约 0.14。
+    /// 旧版是线性且封顶 0.09，一百字和一千字的「距离感」几乎没差别。
     private func distPenalty(_ jump: Int) -> Float {
-        if jump >= 0 { return min(0.09, 0.0006 * Float(jump)) }
-        return min(0.05, 0.00025 * Float(-jump))
+        if jump >= 0 { return min(0.20, 0.009 * Float(jump).squareRoot()) }
+        return min(0.06, 0.0004 * Float(-jump))
     }
 
     /// 这个位置是不是（或紧挨着）某个句子的开头。二分查找，句子起点是升序的
@@ -334,11 +370,13 @@ final class Follower {
         let sp = Array(spRaw[(m - probeLen)...])
         let spPy = sp.map { Py.syllables($0) }
 
-        // 卡得越久看得越远，但「看得远」只在证据够足时才作数，见 pass()
-        var win = 130
-        if stall >= 6 { win = 260 }
-        if stall >= 14 { win = 560 }
-        if stall >= 24 { win = 1000 }
+        // 卡得越久看得越远，但「看得远」只在证据够足时才作数，见 pass()。
+        // 上限压到 320：原来放到 1000 等于把整篇都当候选，随便一个重复句就能命中。
+        // 放大得比旧版早（3 拍、8 拍）：用户读跳一段，两三秒内就该追上，
+        // 而不是先卡五六秒才肯往后看。
+        var win = 150
+        if stall >= 3 { win = 220 }
+        if stall >= 8 { win = 320 }
 
         let e = best(sp, spPy, cursor, BACK, win)
         if e >= 0 {
@@ -355,6 +393,25 @@ final class Follower {
         lastStep = 0
         stall += 1
         if m > lastSpokenLen { grow += 1 } else { grow = 0 }
+
+        // 大步跳过去以后又连着十来帧对不上：基本可以断定是跳错了。
+        // 用户最难受的不是没跟上，而是一次乱跑之后整篇都废了、只能退出去重来。
+        // 这里自动退回跳之前的位置（只回退，不前进，所以不会来回抖）。
+        // 判定「跳错了」用两个信号：时间过了五秒，而且从落点几乎没往前走。
+        // 只看「卡了几拍」不靠谱——错的位置撞上「我们」「这个」会不停伪造成功。
+        if let back = jumpBack, Date() > jumpBackDeadline, cursor - jumpTo < 15 {
+            jumpBack = nil
+            bigJumpAt = Date.distantPast        // 回退之后允许它重新找，别被自己的抑制卡死
+            cursor = back
+            stall = 0
+            grow = 0
+            creeped = 0
+            lastMatchAt = Date()
+            lastSpokenLen = m
+            lastScore = 1
+            lastStep = 0
+            return cursor
+        }
 
         // 一直在说但一直没对上：挪一点，别让画面僵死。
         // 但一轮最多 4 个字——挪多了就成了「不对也在往后放」，正是用户反馈的现象
@@ -376,13 +433,26 @@ final class Follower {
 
     /// 一次成功的推进（可前可后）
     private func commit(_ e: Int, _ m: Int) -> Int {
-        lastStep = e - cursor
+        let from = cursor
+        let moved = e - from
+        lastStep = moved
         cursor = e
         stall = 0
         grow = 0
         creeped = 0
         lastMatchAt = Date()
         lastSpokenLen = m
+
+        if moved > 40 {
+            bigJumpAt = Date()
+            // 记下「从哪儿跳的、跳到哪儿」，五秒后从落点没往前走就退回去
+            jumpBack = from
+            jumpTo = e
+            jumpBackDeadline = Date().addingTimeInterval(5.0)
+        } else if jumpBack != nil, cursor - jumpTo >= 15 {
+            // 从落点往前走了十几个字：这一段是真读下来了，这一跳是对的
+            jumpBack = nil
+        }
         return cursor
     }
 
@@ -425,6 +495,8 @@ final class Follower {
         var bestI = -1
         var bestRank = Float.greatestFiniteMagnitude
         var bestRaw: Float = 1
+        /// 两秒半内已经大步前进过一次（见 commit），这一轮再大步前进就不认
+        let recentBig = Date().timeIntervalSince(bigJumpAt) < 2.5
 
         var i = lo + 1
         while i <= hi {
@@ -464,7 +536,10 @@ final class Follower {
 
             let jump = i - after
             let raw = Float(d[k]) / (100.0 * Float(eff))
-            if pass(jump, raw, run[k], eff, good[k]) {
+            // 两秒半内刚大步前进过一次，这一轮不许再大步前进（往回退不算）。
+            // 「顺着重复的字一路往下滑」的典型形态就是连着一跳接一跳。
+            let blocked = recentBig && jump > 40
+            if !blocked && pass(jump, raw, run[k], eff, good[k]) {
                 var rank = raw + distPenalty(jump)
                 if nearSentenceStart(i, 1) { rank -= 0.015 }
                 if rank < bestRank {
@@ -490,6 +565,21 @@ final class Follower {
         lastSpokenLen = 0
         grow = 0
         creeped = 0
+    }
+
+    /// 手动把游标挪到某处（用户双击台本指定起点）。
+    /// 所有「跳转」相关的状态一起清掉，否则刚定的位置会被上一次的后悔药拽回去。
+    func jump(_ i: Int) {
+        cursor = min(max(0, i), n)
+        stall = 0
+        creeped = 0
+        grow = 0
+        jumpBack = nil
+        bigJumpAt = Date.distantPast
+        lastMatchAt = Date()
+        lastSpokenLen = 0
+        lastScore = 1
+        lastStep = 0
     }
 }
 
@@ -532,6 +622,28 @@ final class PrompterEngine: ObservableObject {
         if cursor <= 0 { return 0 }
         if cursor >= n { return prepared.text.utf16.count }
         return prepared.offsets[cursor]
+    }
+
+    /// 原文里的 UTF-16 位置 → 台本下标（双击定位用）
+    func normIndex(forUTF16 off: Int) -> Int {
+        let o = prepared.offsets
+        if o.isEmpty { return 0 }
+        var lo = 0, hi = o.count - 1, ans = o.count
+        while lo <= hi {
+            let mid = (lo + hi) >> 1
+            if o[mid] >= off { ans = mid; hi = mid - 1 } else { lo = mid + 1 }
+        }
+        return min(ans, o.count)
+    }
+
+    /// 手动指定跟读起点。落在句子中间时自动退到这一句的开头——
+    /// 人都是「从这句重新念」，不会从半句开始。
+    func jump(to index: Int) {
+        var i = min(max(0, index), prepared.norm.count)
+        if let s = prepared.sentenceStarts.last(where: { $0 <= i }) { i = s }
+        follower.jump(i)
+        cursor = i
+        lastStep = 0
     }
 
     var percent: Int {

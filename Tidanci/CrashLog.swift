@@ -61,6 +61,49 @@ enum CrashLog {
 
 private var gCrashFD: Int32 = -1
 
+/// 录制诊断。iPhone 上看不到控制台，「这条为什么没声音」只能靠现场留下的数字：
+/// 收到了多少帧音频、备份写了多少字节、成片音轨峰值多少、音频会话是什么类别。
+/// 出问题时在「我的 → 关于」里直接能看到，不用再让用户猜。
+enum Diag {
+
+    private static let q = DispatchQueue(label: "tidanci.diag")
+    private static let fmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm:ss"
+        return f
+    }()
+
+    static var url: URL {
+        let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        return d.appendingPathComponent("audio-diag.txt")
+    }
+
+    static func note(_ s: String) {
+        let stamp = fmt.string(from: Date())
+        q.async {
+            var text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+            text += "[\(stamp)] \(s)\n"
+            let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+            if lines.count > 160 {
+                text = lines.suffix(120).joined(separator: "\n") + "\n"
+            }
+            try? text.write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+
+    static func read() -> String? {
+        q.sync {
+            let t = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+            let trimmed = t.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+    }
+
+    static func clear() {
+        q.async { try? "".write(to: url, atomically: true, encoding: .utf8) }
+    }
+}
+
 /// 提前备好的字节，信号处理里直接写，不做任何分配
 private let gSignalBytes: [UInt8] = Array("\n[信号] 进程被信号终止（闪退）\n".utf8)
 

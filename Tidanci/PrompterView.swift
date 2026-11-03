@@ -17,6 +17,10 @@ struct ScriptTextView: UIViewRepresentable {
     let boxHeight: CGFloat
     let onReady: (UITextView) -> Void
     let onResize: (UITextView) -> Void
+    /// 双击某一行：把跟读起点挪到那一句。
+    /// 识别再怎么设限也可能被一段重复的话带偏，给用户一个「我自己指」的出口，
+    /// 比让他退出去重录一条强。
+    var onLocate: ((Int) -> Void)? = nil
 
     func makeUIView(context: Context) -> UITextView {
         let tv = UITextView()
@@ -26,6 +30,11 @@ struct ScriptTextView: UIViewRepresentable {
         tv.showsVerticalScrollIndicator = false
         tv.alwaysBounceVertical = true
         tv.textContainerInset = UIEdgeInsets(top: 0, left: 18, bottom: 0, right: 18)
+
+        let tap = UITapGestureRecognizer(target: context.coordinator,
+                                         action: #selector(Coordinator.handleTap(_:)))
+        tap.numberOfTapsRequired = 2
+        tv.addGestureRecognizer(tap)
 
         let h = max(boxHeight, 90)
         let top = h * ScriptTextView.focus
@@ -47,12 +56,27 @@ struct ScriptTextView: UIViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
-    final class Coordinator {
+    final class Coordinator: NSObject {
         var parent: ScriptTextView
         var lastHeight: CGFloat = 0
         private var lastKey = ""
 
-        init(_ p: ScriptTextView) { parent = p }
+        init(_ p: ScriptTextView) {
+            parent = p
+            super.init()
+        }
+
+        /// 双击：算出点到的是第几个字符，交给外面换算成台本位置
+        @objc func handleTap(_ g: UITapGestureRecognizer) {
+            guard let tv = g.view as? UITextView else { return }
+            let p = g.location(in: tv)
+            let inText = CGPoint(x: p.x - tv.textContainerInset.left,
+                                 y: p.y - tv.textContainerInset.top)
+            let idx = tv.layoutManager.characterIndex(for: inText,
+                                                     in: tv.textContainer,
+                                                     fractionOfDistanceBetweenInsertionPoints: nil)
+            parent.onLocate?(idx)
+        }
 
         /// 框被拖动改大改小时，内边距要跟着变，否则焦点线会跑偏
         func syncInset(_ tv: UITextView) {
@@ -139,6 +163,9 @@ struct PrompterView: View {
 
     @State private var followOn = true
     @State private var autoScroll = false
+    /// 双击定位的首次提示，只出现一次
+    @State private var locateHintShown = false
+    @State private var lastCursorForHint = 0
     @State private var cameraOn = true
     @State private var statusText = "准备中"
     @State private var tip: String?
@@ -177,6 +204,12 @@ struct PrompterView: View {
                                    onResize: { tv in
                                        textView = tv
                                        scrollTo(engine.cursor)
+                                   },
+                                   onLocate: { off in
+                                       let i = engine.normIndex(forUTF16: off)
+                                       engine.jump(to: i)
+                                       Haptics.tap()
+                                       showTip(followOn ? "从这句开始跟" : "位置已挪到这里")
                                    })
                 }
 
@@ -195,7 +228,16 @@ struct PrompterView: View {
         .statusBarHidden(true)
         .onAppear(perform: boot)
         .onDisappear(perform: bye)
-        .onChange(of: engine.cursor) { c in scrollTo(c) }
+        .onChange(of: engine.cursor) { c in
+            scrollTo(c)
+            // 一次跳了几十个字：多半是被重复的话带偏了。这时候告诉用户「能自己指」，
+            // 比让他顶着错位继续念、或者退出去重录强。
+            if !locateHintShown && abs(c - lastCursorForHint) > 60 {
+                locateHintShown = true
+                showTip("位置跳远了？双击文字可以指定从哪句开始")
+            }
+            lastCursorForHint = c
+        }
         .onChange(of: qualityRaw) { _ in applyQuality() }
         .onChange(of: fpsSetting) { _ in applyQuality() }
         .onChange(of: mirrorSave) { v in cam.setMirrorSave(v) }

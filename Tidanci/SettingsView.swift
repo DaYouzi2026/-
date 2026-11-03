@@ -16,6 +16,7 @@ struct SettingsView: View {
 
     @State private var toast: String?
     @State private var crashText: String?
+    @State private var diagText: String?
 
     private var quality: VideoQuality { VideoQuality(rawValue: qualityRaw) ?? .uhd }
     private var frame: FrameRate { FrameRate(rawValue: fps) ?? .fps30 }
@@ -52,7 +53,10 @@ struct SettingsView: View {
                 }
             }
             .navigationBarHidden(true)
-            .onAppear { crashText = CrashLog.read() }
+            .onAppear {
+                crashText = CrashLog.read()
+                diagText = Diag.read()
+            }
         }
     }
 
@@ -252,7 +256,7 @@ struct SettingsView: View {
                 HStack {
                     Text("提词大师").font(.system(size: 14, weight: .semibold)).foregroundColor(T.ink)
                     Spacer()
-                    Text("1.11")
+                    Text("1.13")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundColor(T.sub)
                 }
@@ -266,7 +270,54 @@ struct SettingsView: View {
             RowDivider()
 
             crashRow
+
+            RowDivider()
+
+            diagRow
         }
+    }
+
+    /// 录音诊断：录完没声音时，这一块能直接说明「麦克风有没有出数据」。
+    /// 收到的帧数是 0，就是采集断了；帧数正常但成片没声，就是写入/编码断了。
+    @ViewBuilder
+    private var diagRow: some View {
+        let text = diagText
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("录音诊断")
+                    .font(.system(size: 13))
+                    .foregroundColor(T.ink2)
+                Spacer()
+                if text == nil {
+                    Text("没有记录").font(.system(size: 12)).foregroundColor(T.sub)
+                } else {
+                    Button {
+                        Diag.clear()
+                        diagText = Diag.read()
+                        show("已清掉记录")
+                    } label: {
+                        Text("清掉")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(T.accent)
+                    }
+                }
+            }
+            if let text {
+                Text(text)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(T.sub)
+                    .lineLimit(14)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(T.surface2)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                Text("录完一条没声音的，把这块截图发我")
+                    .font(.system(size: 10))
+                    .foregroundColor(T.sub)
+            }
+        }
+        .padding(16)
     }
 
     /// 闪退自证：上次崩溃的原因直接摆在设置里，截图发过来就能定位
