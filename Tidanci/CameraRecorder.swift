@@ -1156,8 +1156,14 @@ final class CameraRecorder: NSObject, ObservableObject {
         writer.startSession(atSourceTime: .zero)
 
         var chunks = 0
+        var spins = 0
         while writer.status == .writing {
+            if reader.status == .failed {
+                Diag.note("AAC：reader 失败 \(reader.error?.localizedDescription ?? "-")")
+                break
+            }
             if input.isReadyForMoreMediaData {
+                spins = 0
                 if let sb = readerOut.copyNextSampleBuffer() {
                     if input.append(sb) { chunks += 1 }
                 } else {
@@ -1165,6 +1171,13 @@ final class CameraRecorder: NSObject, ObservableObject {
                     break
                 }
             } else {
+                // 编码器一直说「忙」就是卡住了，别把后台线程永远挂在这儿
+                spins += 1
+                if spins > 5000 {
+                    Diag.note("AAC：编码器卡住，放弃")
+                    writer.cancelWriting()
+                    return nil
+                }
                 Thread.sleep(forTimeInterval: 0.004)
             }
         }
