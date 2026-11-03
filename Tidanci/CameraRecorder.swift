@@ -95,6 +95,8 @@ final class CameraRecorder: NSObject, ObservableObject {
     private var audioNextRetry: CFTimeInterval = 0
 
     @Published private(set) var ready = false
+    /// 录完之后正在重建音轨。长视频要几秒，界面得给个动静
+    @Published private(set) var tidying = false
     @Published private(set) var recording = false {
         didSet { AudioSession.cameraBusy = recording }
     }
@@ -253,11 +255,11 @@ final class CameraRecorder: NSObject, ObservableObject {
         guard !observingSession else { return }
         observingSession = true
         let c = NotificationCenter.default
-        c.addObserver(forName: AVCaptureSession.wasInterruptedNotification,
+        c.addObserver(forName: .AVCaptureSessionWasInterrupted,
                       object: session, queue: nil) { _ in
             Diag.note("相机会话被中断（录音会停，这一段靠备份兜）")
         }
-        c.addObserver(forName: AVCaptureSession.interruptionEndedNotification,
+        c.addObserver(forName: .AVCaptureSessionInterruptionEnded,
                       object: session, queue: nil) { [weak self] _ in
             guard let self else { return }
             Diag.note("相机会话中断结束")
@@ -270,7 +272,7 @@ final class CameraRecorder: NSObject, ObservableObject {
                 AudioSession.enforceForCamera()
             }
         }
-        c.addObserver(forName: AVCaptureSession.runtimeErrorNotification,
+        c.addObserver(forName: .AVCaptureSessionRuntimeError,
                       object: session, queue: nil) { [weak self] note in
             guard let self else { return }
             let code = (note.userInfo?[AVCaptureSessionErrorKey] as? NSError)?.code ?? 0
@@ -948,7 +950,11 @@ final class CameraRecorder: NSObject, ObservableObject {
                     // 成片看着没问题也照样用备份重建：直通合成只要一两秒，
                     // 视频一个像素都不动。相机那条音轨太不可靠了 —— 诊断里
                     // 「成片音轨=无」是常态，与其赌它这次写对了，不如统一用备份。
-                    self.mux(video: video, audio: b, offset: offset, mustFix: broken, done: done)
+                    self.tidying = true
+                    self.mux(video: video, audio: b, offset: offset, mustFix: broken) { url in
+                        self.tidying = false
+                        done(url)
+                    }
                 }
             }
         }

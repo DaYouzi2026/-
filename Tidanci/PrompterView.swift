@@ -523,6 +523,24 @@ struct PrompterView: View {
                     .foregroundColor(.white)
                     .shadow(color: Color.black.opacity(0.45), radius: 20)
             }
+            // 长视频要重建音轨，直通也要几秒。不给点动静，用户会以为「录完什么都没发生」
+            if cam.tidying {
+                VStack {
+                    Spacer()
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .scaleEffect(0.75)
+                        Text("正在整理音轨…")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundColor(.white)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(Capsule().fill(Color.black.opacity(0.55)))
+                    .padding(.bottom, 168)
+                }
+                .allowsHitTesting(false)
+            }
         }
         .allowsHitTesting(countdownLeft > 0)
     }
