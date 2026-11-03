@@ -256,7 +256,7 @@ struct SettingsView: View {
                 HStack {
                     Text("提词大师").font(.system(size: 14, weight: .semibold)).foregroundColor(T.ink)
                     Spacer()
-                    Text("1.15")
+                    Text("1.16")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundColor(T.sub)
                 }

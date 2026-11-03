@@ -1039,15 +1039,19 @@ final class CameraRecorder: NSObject, ObservableObject {
     }
 
     private func mux(video: URL, audio: URL, offset: Double,
-                     mustFix: Bool, done: @escaping (URL?) -> Void) {
+                     mustFix: Bool, preferPCM: Bool = false,
+                     done: @escaping (URL?) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             // ① 备份是 WAV（PCM），mp4 容器装不了。先单独编码成 AAC——
             //    只要音轨是 AAC，整个片子就能走 passthrough：视频一个像素都不重编码。
             //    旧版一律 HighestQuality，4K 片子要重压十几秒，用户以为卡死了。
             let t0 = CACurrentMediaTime()
-            let aac = self.encodeAAC(audio)
-            Diag.note("音频准备：AAC \(aac == nil ? "失败" : "成功")，耗时 "
-                      + String(format: "%.1fs", CACurrentMediaTime() - t0))
+            // preferPCM：上一轮 AAC 音轨插不进合成时的兜底，直接用原始 WAV。
+            // mp4 装不了 PCM，会走重编码，慢一些但基本不会失败。
+            let aac = preferPCM ? nil : self.encodeAAC(audio)
+            Diag.note("音频准备：\(preferPCM ? "改用 WAV 原始音频" : "AAC")"
+                      + (aac == nil && !preferPCM ? "失败" : "成功")
+                      + "，耗时 " + String(format: "%.1fs", CACurrentMediaTime() - t0))
             if aac == nil, !mustFix {
                 // 编码没成、成片音轨又是好的：没必要为了保险去重压一条四分钟的 4K
                 Diag.note("AAC 失败但成片音轨正常，保持原样")
@@ -1070,7 +1074,13 @@ final class CameraRecorder: NSObject, ObservableObject {
                 return
             }
             let vd = va.duration
-            try? vt2.insertTimeRange(CMTimeRange(start: .zero, duration: vd), of: vt, at: .zero)
+            do {
+                try vt2.insertTimeRange(CMTimeRange(start: .zero, duration: vd), of: vt, at: .zero)
+            } catch {
+                Diag.note("合成失败：视频轨插入出错 \(error.localizedDescription)")
+                DispatchQueue.main.async { done(video) }
+                return
+            }
             vt2.preferredTransform = vt.preferredTransform
 
             // 音轨按「视频还剩多长」和「备份实际多长」里较短的那个插。
@@ -1080,16 +1090,45 @@ final class CameraRecorder: NSObject, ObservableObject {
             let aRange = at.timeRange
             let room = max(0, vd.seconds - offset)
             let len = min(room, aRange.duration.seconds)
+            // 这里以前是 try?：插入失败被吞掉，日志照样打「实插 13.6s」，
+            // 结果导出一条没有音轨的片子，用户听到的就是「补了还是没声音」。
+            var inserted = false
+            var insertError = ""
             if len > 0.1 {
-                try? at2.insertTimeRange(CMTimeRange(start: aRange.start,
-                                                     duration: CMTime(seconds: len, preferredTimescale: 600)),
-                                         of: at,
-                                         at: start)
+                do {
+                    try at2.insertTimeRange(CMTimeRange(start: aRange.start,
+                                                        duration: CMTime(seconds: len, preferredTimescale: 600)),
+                                            of: at,
+                                            at: start)
+                    inserted = true
+                } catch {
+                    insertError = error.localizedDescription
+                }
+            } else {
+                insertError = "可用长度不足（\(String(format: "%.2f", len))s）"
             }
             Diag.note("合成：视频 \(String(format: "%.1f", vd.seconds))s 备份 "
                       + "\(String(format: "%.1f", aRange.duration.seconds))s 偏移 "
                       + String(format: "%.2f", offset) + "s 实插 "
-                      + String(format: "%.1f", len) + "s")
+                      + String(format: "%.1f", len) + "s "
+                      + (inserted ? "音轨已插入" : "音轨插入失败：\(insertError)"))
+
+            // 没插上就别导出了：导出来的一定是一条没声的片子。如果这次用的是
+            // AAC，先退回原始 WAV 再试一次——AAC 轨道偶尔会因容器差异插不进去，
+            // PCM 没这个问题（代价是整片重编码，短片子很快）。
+            guard inserted else {
+                if !preferPCM {
+                    Diag.note("AAC 音轨插入失败，改用 WAV 原始音频再试一次")
+                    self.mux(video: video, audio: audio, offset: offset,
+                             mustFix: true, preferPCM: true, done: done)
+                    return
+                }
+                DispatchQueue.main.async {
+                    self.recordingError = "补音轨没成功（插入失败），这条可能没声音"
+                    done(video)
+                }
+                return
+            }
 
             let ext = video.pathExtension.lowercased() == "mov" ? "mov" : "mp4"
             let tmp = FileManager.default.temporaryDirectory
@@ -1136,9 +1175,26 @@ final class CameraRecorder: NSObject, ObservableObject {
                     Diag.note("改名替换也失败：\(error.localizedDescription)")
                 }
             }
+            // 替换完再验一遍。只看到「导出成功」是不够的：replaceItemAt 有可能不抛错
+            // 却没真正换上去，也可能换上去的文件音轨是空的。用户要的只有一件事——
+            // 这条到底有没有声音，所以直接读最终文件确认。
+            let check = SilenceCut.statsSampled(video)
+            let audible = check.duration >= vd.seconds * 0.9 && check.peak > -52
+            Diag.note("成片自检：音轨="
+                      + String(format: "%.1fs/%.0fdB", check.duration, check.peak)
+                      + " 视频=\(String(format: "%.1fs", vd.seconds))"
+                      + " 替换=\(replaced ? "成功" : "失败")"
+                      + " 判定=\(audible ? "有声" : "仍然没声")")
+
             DispatchQueue.main.async {
-                // 成功就静默——用户只需要听到声音，不需要知道过程
-                self.recordingError = replaced ? "" : "音轨合成失败，这条可能没声音"
+                if audible {
+                    // 成功就静默——用户只需要听到声音，不需要知道过程
+                    self.recordingError = ""
+                } else if !replaced {
+                    self.recordingError = "音轨补好了，但没能替换进成片，去作品里删掉这条重录"
+                } else {
+                    self.recordingError = "补完音轨还是没声音，建议重录一条"
+                }
                 done(video)
             }
         }
