@@ -391,39 +391,45 @@ final class VideoEditor: ObservableObject {
             } catch {
                 lastErr = error
                 Diag.note("字幕：\(onDevice ? "本地" : "联网")识别失败 \(error.localizedDescription)")
+                // 本地这次失败后立刻换联网，识别器有时还没完全松开，稍等一下再发
+                if !modes.isEmpty { Thread.sleep(forTimeInterval: 0.4) }
             }
         }
         throw lastErr ?? Fail(msg: "识别失败")
     }
 
     private static func ask(_ url: URL,
-                           rec: SFSpeechRecognizer,
+                            rec: SFSpeechRecognizer,
                             onDevice: Bool) throws -> SFTranscription {
         let req = SFSpeechURLRecognitionRequest(url: url)
-        req.shouldReportPartialResults = false
+        req.shouldReportPartialResults = true
         req.requiresOnDeviceRecognition = onDevice
         req.addsPunctuation = true
 
         let sem = DispatchSemaphore(value: 0)
         var text: SFTranscription?
+        var partial: SFTranscription?
         var failed: Error?
 
-        rec.recognitionTask(with: req) { res, err in
+        let task = rec.recognitionTask(with: req) { res, err in
+            if let r = res {
+                if r.isFinal { text = r.bestTranscription } else { partial = r.bestTranscription }
+            }
             if let e = err {
                 if failed == nil { failed = e }
                 sem.signal()
                 return
             }
-            guard let r = res, r.isFinal else { return }
-            text = r.bestTranscription
-            sem.signal()
+            if res?.isFinal == true { sem.signal() }
         }
 
         // 45 秒一段，正常几秒就回；卡到 90 秒就是出问题了，别把整条流程拖死
         if sem.wait(timeout: .now() + 90) == .timedOut {
-            throw Fail(msg: "识别超时")
+            task.cancel()
         }
+        // 收尾没回来但过程中已经吐过字，就用最后那版 —— 有字总比一个字都没有强
         if let t = text, !t.segments.isEmpty { return t }
+        if let p = partial, !p.segments.isEmpty { return p }
         throw failed ?? Fail(msg: "这一段没识别出内容")
     }
 
