@@ -401,6 +401,17 @@ struct EditorView: View {
                 Spacer()
             }
 
+            if subtitle {
+                HStack(spacing: 6) {
+                    Image(systemName: editor.cueCount > 0 ? "text.bubble.fill" : "text.bubble")
+                        .font(.system(size: 12, weight: .semibold))
+                    Text(subtitleSummary)
+                        .font(.system(size: 12))
+                }
+                .foregroundColor(editor.cueCount > 0 && !editor.subtitleDropped ? T.ok : T.sub)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
             if let r = result {
                 HStack(spacing: 10) {
                     Button {
@@ -428,8 +439,14 @@ struct EditorView: View {
         )
     }
 
-    private func miniButton(_ title: String, _ icon: String, _ color: Color) -> some View {
-        HStack(spacing: 6) {
+    /// 字幕到底成没成，直接写在完成卡片上 —— 别再让人对着片子猜「为什么一个字都没有」
+    private var subtitleSummary: String {
+        if editor.subtitleDropped { return "字幕：烧录失败，已交付无字幕成片（原因见诊断日志）" }
+        if editor.cueCount > 0 { return "字幕：\(editor.cueCount) 条，已烧进画面" }
+        return "字幕：一条也没识别出来（原因见下方提示）"
+    }
+
+    private func miniButton(_ title: String, _ icon: String, _ color: Color) -> some View {        HStack(spacing: 6) {
             Image(systemName: icon).font(.system(size: 13, weight: .semibold))
             Text(title).font(.system(size: 12, weight: .medium))
         }

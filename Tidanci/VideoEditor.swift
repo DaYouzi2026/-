@@ -40,6 +40,10 @@ final class VideoEditor: ObservableObject {
     @Published var progress: Double = 0
     @Published var running = false
     @Published var statusText: String = ""
+    /// 这次到底识别出几条字幕 —— 0 就是「一个字都没有」，界面要如实说出来
+    @Published var cueCount = 0
+    /// 字幕识别出来了但没烧上（带字幕导出失败，改交无字幕成片）
+    @Published var subtitleDropped = false
 
     private let workQ = DispatchQueue(label: "video.editor", qos: .userInitiated)
 
@@ -74,6 +78,8 @@ final class VideoEditor: ObservableObject {
         progress = 0
         stage = .preparing
         statusText = "读视频…"
+        cueCount = 0
+        subtitleDropped = false
 
         workQ.async {
             var notes: [String] = []
@@ -127,9 +133,15 @@ final class VideoEditor: ObservableObject {
                     self.progress = 0.48
                 }
                 do {
-                    cues = try self.transcribe(newAudio ?? input)
+                    // 注意：这里喂的是「从视频里抽出来的音频」，不是视频文件本身。
+                    // 直接把 .mp4 交给 SFSpeechURLRecognitionRequest，十次有九次报
+                    // kAFAssistantErrorDomain 1101 —— 一个字都不给。
+                    cues = try self.transcribe(asset, limit: asset.duration.seconds)
+                    let n = cues.count
+                    DispatchQueue.main.async { self.cueCount = n }
                 } catch {
-                    notes.append("字幕没识别出来")
+                    notes.append("字幕没识别出来：\(error.localizedDescription)")
+                    Diag.note("字幕：整体失败 \(error.localizedDescription)")
                 }
             }
 
@@ -298,41 +310,277 @@ final class VideoEditor: ObservableObject {
     }
 
     // MARK: - 字幕识别
+    //
+    // 老版本这里是「把视频 URL 直接丢给 SFSpeechURLRecognitionRequest」，两个硬坑：
+    //
+    //   1. 它要的是**音频文件**。拿 .mp4 喂进去，多数机型直接报
+    //      kAFAssistantErrorDomain 1101（甚至 0 条结果但不报错），
+    //      现象就是「识别了半天，画面里一个字都没有」。
+    //   2. 单次请求大概只吃得下 1 分钟音频。四分钟的口播整段喂进去，
+    //      后面三分钟直接丢，长片几乎必然没字幕。
+    //
+    // 现在改成：先抽 16k 单声道 WAV → 按 45 秒切段 → 逐段识别 →
+    // 把每段的时间轴加回去 → 合并去重。任何一段失败都不影响别的段。
 
-    private func transcribe(_ url: URL) throws -> [SubtitleCue] {
+    private func transcribe(_ asset: AVAsset, limit: Double) throws -> [SubtitleCue] {
+        try Self.ensureSpeechAuth()
+
         let loc = Locale(identifier: "zh-CN")
         guard let rec = SFSpeechRecognizer(locale: loc) else {
             throw Fail(msg: "这台设备不支持中文识别")
         }
         guard rec.isAvailable else {
-            throw Fail(msg: "语音识别暂时不可用")
+            throw Fail(msg: "语音识别暂时不可用（可能是没网，或系统还没下好中文包）")
         }
 
+        let wav = Self.temp("speech.wav")
+        let audioLen = try extractAudio(asset, to: wav)
+        guard audioLen > 0.3 else { throw Fail(msg: "音轨太短，没得识别") }
+
+        let parts = try splitWAV(wav, chunkSeconds: 45)
+        try? FileManager.default.removeItem(at: wav)
+        guard !parts.isEmpty else { throw Fail(msg: "音频切不出来") }
+        Diag.note("字幕：音频 \(String(format: "%.1f", audioLen))s，切成 \(parts.count) 段")
+
+        var cues: [SubtitleCue] = []
+        var lastErr: Error?
+        var okParts = 0
+
+        for (i, p) in parts.enumerated() {
+            do {
+                let got = try recognizeFile(p.url, rec: rec)
+                okParts += 1
+                cues += got.map {
+                    SubtitleCue(start: $0.start + p.offset,
+                                end: $0.end + p.offset,
+                                text: $0.text)
+                }
+                Diag.note("字幕：第 \(i + 1)/\(parts.count) 段拿到 \(got.count) 条")
+            } catch {
+                lastErr = error
+                Diag.note("字幕：第 \(i + 1)/\(parts.count) 段失败 \(error.localizedDescription)")
+            }
+            try? FileManager.default.removeItem(at: p.url)
+            DispatchQueue.main.async {
+                self.progress = 0.48 + 0.22 * Double(i + 1) / Double(parts.count)
+            }
+        }
+
+        if cues.isEmpty {
+            throw Fail(msg: lastErr?.localizedDescription ?? "没识别到字幕")
+        }
+        if okParts == 0 { throw Fail(msg: lastErr?.localizedDescription ?? "识别全失败了") }
+
+        let out = Self.sanitize(cues, limit: limit)
+        Diag.note("字幕：合并后 \(out.count) 条，覆盖到 "
+                  + "\(String(format: "%.1f", out.last?.end ?? 0))s")
+        return out
+    }
+
+    /// 一次识别请求。先按「本地识别」跑（快、离线可用），
+    /// 本地没装中文包或者报错，再退回联网识别 —— 两遍都败才认输。
+    private func recognizeFile(_ url: URL, rec: SFSpeechRecognizer) throws -> [SubtitleCue] {
+        var modes: [Bool] = rec.supportsOnDeviceRecognition ? [true, false] : [false]
+        var lastErr: Error?
+
+        while let onDevice = modes.first {
+            modes.removeFirst()
+            do {
+                let t = try Self.ask(url, rec: rec, onDevice: onDevice)
+                return Self.buildCues(t)
+            } catch {
+                lastErr = error
+                Diag.note("字幕：\(onDevice ? "本地" : "联网")识别失败 \(error.localizedDescription)")
+            }
+        }
+        throw lastErr ?? Fail(msg: "识别失败")
+    }
+
+    private static func ask(_ url: URL,
+                           rec: SFSpeechRecognizer,
+                            onDevice: Bool) throws -> SFTranscription {
         let req = SFSpeechURLRecognitionRequest(url: url)
         req.shouldReportPartialResults = false
-        if rec.supportsOnDeviceRecognition {
-            req.requiresOnDeviceRecognition = true
-        }
+        req.requiresOnDeviceRecognition = onDevice
+        req.addsPunctuation = true
 
         let sem = DispatchSemaphore(value: 0)
-        var cues: [SubtitleCue] = []
+        var text: SFTranscription?
         var failed: Error?
 
         rec.recognitionTask(with: req) { res, err in
             if let e = err {
-                failed = e
+                if failed == nil { failed = e }
                 sem.signal()
                 return
             }
             guard let r = res, r.isFinal else { return }
-            cues = Self.buildCues(r.bestTranscription)
+            text = r.bestTranscription
             sem.signal()
         }
 
-        _ = sem.wait(timeout: .now() + 240)
-        if let e = failed, cues.isEmpty { throw e }
-        if cues.isEmpty { throw Fail(msg: "没识别到字幕") }
-        return cues
+        // 45 秒一段，正常几秒就回；卡到 90 秒就是出问题了，别把整条流程拖死
+        if sem.wait(timeout: .now() + 90) == .timedOut {
+            throw Fail(msg: "识别超时")
+        }
+        if let t = text, !t.segments.isEmpty { return t }
+        throw failed ?? Fail(msg: "这一段没识别出内容")
+    }
+
+    /// 从视频里抽 16k 单声道 WAV。语音识别只吃这种最保险。
+    private func extractAudio(_ asset: AVAsset, to out: URL) throws -> Double {
+        guard let aTrack = asset.tracks(withMediaType: .audio).first else {
+            throw Fail(msg: "这个视频里没有声音，识别不了")
+        }
+        let sr = 16000.0
+        guard let fmt = AVAudioFormat(standardFormatWithSampleRate: sr, channels: 1) else {
+            throw Fail(msg: "音频格式不支持")
+        }
+
+        let reader = try AVAssetReader(asset: asset)
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMIsNonInterleaved: false,
+            AVSampleRateKey: sr,
+            AVNumberOfChannelsKey: 1
+        ]
+        let trackOut = AVAssetReaderTrackOutput(track: aTrack, outputSettings: settings)
+        trackOut.alwaysCopiesSampleData = false
+        guard reader.canAdd(trackOut) else { throw Fail(msg: "读不了音轨") }
+        reader.add(trackOut)
+        guard reader.startReading() else { throw Fail(msg: "读音轨失败") }
+
+        let fileSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: sr,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false
+        ]
+        try? FileManager.default.removeItem(at: out)
+        let file = try AVAudioFile(forWriting: out,
+                                   settings: fileSettings,
+                                   commonFormat: .pcmFormatFloat32,
+                                   interleaved: false)
+
+        var frames: AVAudioFramePosition = 0
+        while let sb = trackOut.copyNextSampleBuffer() {
+            guard let bb = CMSampleBufferGetDataBuffer(sb) else { continue }
+            let len = CMBlockBufferGetDataLength(bb)
+            let n = len / 4
+            if n <= 0 { continue }
+            guard let buf = AVAudioPCMBuffer(pcmFormat: fmt,
+                                             frameCapacity: AVAudioFrameCount(n)) else { continue }
+            let ptr = UnsafeMutablePointer<Int8>.allocate(capacity: len)
+            defer { ptr.deallocate() }
+            if CMBlockBufferCopyDataBytes(bb, atOffset: 0, dataLength: len, destination: ptr) != noErr {
+                continue
+            }
+            memcpy(buf.floatChannelData![0], ptr, len)
+            buf.frameLength = AVAudioFrameCount(n)
+            try file.write(from: buf)
+            frames += AVAudioFramePosition(n)
+        }
+
+        let secs = Double(frames) / sr
+        if secs <= 0 { throw Fail(msg: "音轨是空的") }
+        return secs
+    }
+
+    private struct Piece {
+        let url: URL
+        let offset: Double
+    }
+
+    /// 按固定秒数切开，返回每段文件和它在整条音轨里的起点
+    private func splitWAV(_ url: URL, chunkSeconds: Double) throws -> [Piece] {
+        let src = try AVAudioFile(forReading: url)
+        let pf = src.processingFormat
+        let total = src.length
+        let per = AVAudioFramePosition(pf.sampleRate * chunkSeconds)
+        guard per > 0, total > 0 else { return [] }
+
+        let fileSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: pf.sampleRate,
+            AVNumberOfChannelsKey: pf.channelCount,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false
+        ]
+
+        var out: [Piece] = []
+        var pos: AVAudioFramePosition = 0
+        var idx = 0
+        while pos < total {
+            let count = AVAudioFrameCount(min(per, total - pos))
+            guard count > 0,
+                  let buf = AVAudioPCMBuffer(pcmFormat: pf, frameCapacity: count) else { break }
+            src.framePosition = pos
+            try src.read(into: buf, frameCount: count)
+            if buf.frameLength == 0 { break }
+
+            let piece = Self.temp("speech-\(idx).wav")
+            let f = try AVAudioFile(forWriting: piece,
+                                    settings: fileSettings,
+                                    commonFormat: .pcmFormatFloat32,
+                                    interleaved: false)
+            try f.write(from: buf)
+
+            out.append(Piece(url: piece, offset: Double(pos) / pf.sampleRate))
+            pos += AVAudioFramePosition(count)
+            idx += 1
+            if idx > 200 { break }
+        }
+        return out
+    }
+
+    /// 合并后统一收拾：排序、去重叠、掐到片长以内。
+    /// 不收拾的话分段的接缝处两条字幕会叠在一起，屏幕上就是「一坨字」。
+    private static func sanitize(_ cues: [SubtitleCue], limit: Double) -> [SubtitleCue] {
+        var out: [SubtitleCue] = []
+        for c in cues.sorted(by: { $0.start < $1.start }) {
+            let text = c.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.isEmpty { continue }
+
+            var s = max(0, c.start)
+            var e = max(c.end, s + 0.30)
+            if let p = out.last {
+                if s < p.end { s = p.end + 0.02 }
+            }
+            if s >= limit - 0.05 { continue }
+            if e > limit { e = limit }
+            if e - s < 0.12 { continue }
+            // 分段接缝处偶尔会把上一句的尾巴再说一遍，一模一样就直接丢掉
+            if let p = out.last, p.text == text, s - p.end < 0.6 { continue }
+            out.append(SubtitleCue(start: s, end: e, text: text))
+        }
+        return out
+    }
+
+    private static func ensureSpeechAuth() throws {
+        var st = SFSpeechRecognizer.authorizationStatus()
+        if st == .notDetermined {
+            let sem = DispatchSemaphore(value: 0)
+            SFSpeechRecognizer.requestAuthorization { _ in sem.signal() }
+            _ = sem.wait(timeout: .now() + 15)
+            st = SFSpeechRecognizer.authorizationStatus()
+        }
+        switch st {
+        case .authorized:
+            return
+        case .denied:
+            throw Fail(msg: "「语音识别」权限被关了，去 设置 › 提词大师 打开")
+        case .restricted:
+            throw Fail(msg: "这台设备不允许语音识别")
+        default:
+            throw Fail(msg: "语音识别没授权")
+        }
     }
 
     private static func buildCues(_ t: SFTranscription) -> [SubtitleCue] {
@@ -462,8 +710,14 @@ final class VideoEditor: ObservableObject {
             video.frame = parent.frame
             parent.addSublayer(video)
 
+            let limit = total.seconds
+            var burned = 0
             for c in shown {
-                guard c.end > c.start else { continue }
+                // 掐掉气口后片长变短了，落在片尾之后的字幕不要再画
+                guard c.start < limit - 0.05 else { continue }
+                let end = min(c.end, limit)
+                guard end > c.start else { continue }
+                burned += 1
                 let img = Self.subtitleImage(c.text, size: size, style: style)
                 let layer = CALayer()
                 layer.contents = img.cgImage
@@ -486,7 +740,7 @@ final class VideoEditor: ObservableObject {
                 a.values = [0, 1, 1, 0]
                 a.keyTimes = [0, 0.06, 0.94, 1]
                 a.beginTime = AVCoreAnimationBeginTimeAtZero + c.start
-                a.duration = max(0.30, c.end - c.start)
+                a.duration = max(0.30, end - c.start)
                 a.fillMode = .both
                 a.isRemovedOnCompletion = false
                 a.calculationMode = .linear
@@ -499,9 +753,25 @@ final class VideoEditor: ObservableObject {
                 postProcessingAsVideoLayer: video,
                 in: parent
             )
+            Diag.note("字幕：烧进画面 \(burned) 条，画面 \(Int(size.width))x\(Int(size.height))，"
+                      + "\(String(format: "%.1f", limit))s")
         }
 
-        guard let ex = AVAssetExportSession(asset: comp,
+        do {
+            return try Self.export(comp, vc: vc, to: out)
+        } catch {
+            // 带字幕导出这条路炸了，也别让用户白拍 —— 退回无字幕成片，把原因带回界面
+            guard !shown.isEmpty else { throw error }
+            Diag.note("字幕：带字幕导出失败 \(error.localizedDescription)，改导无字幕成片")
+            let plain = Self.temp("edit-plain.mp4")
+            let url = try Self.export(comp, vc: nil, to: plain)
+            DispatchQueue.main.async { self.subtitleDropped = true }
+            return url
+        }
+    }
+
+    private static func export(_ asset: AVAsset, vc: AVVideoComposition?, to out: URL) throws -> URL {
+        guard let ex = AVAssetExportSession(asset: asset,
                                             presetName: AVAssetExportPresetHighestQuality) else {
             throw Fail(msg: "导出器起不来")
         }
@@ -512,8 +782,10 @@ final class VideoEditor: ObservableObject {
 
         let sem = DispatchSemaphore(value: 0)
         ex.exportAsynchronously { sem.signal() }
-        _ = sem.wait(timeout: .now() + 600)
-
+        if sem.wait(timeout: .now() + 600) == .timedOut {
+            ex.cancelExport()
+            throw Fail(msg: "导出超时")
+        }
         if ex.status != .completed {
             throw Fail(msg: ex.error?.localizedDescription ?? "导出失败")
         }

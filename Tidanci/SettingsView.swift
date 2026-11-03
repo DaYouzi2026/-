@@ -256,7 +256,7 @@ struct SettingsView: View {
                 HStack {
                     Text("提词大师").font(.system(size: 14, weight: .semibold)).foregroundColor(T.ink)
                     Spacer()
-                    Text("1.16")
+                    Text("1.17")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundColor(T.sub)
                 }
@@ -284,7 +284,7 @@ struct SettingsView: View {
         let text = diagText
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("录音诊断")
+                Text("诊断日志")
                     .font(.system(size: 13))
                     .foregroundColor(T.ink2)
                 Spacer()
@@ -306,7 +306,7 @@ struct SettingsView: View {
                 Text(text)
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundColor(T.sub)
-                    .lineLimit(14)
+                    .lineLimit(22)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(10)
                     .frame(maxWidth: .infinity, alignment: .leading)
