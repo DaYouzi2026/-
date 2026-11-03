@@ -319,8 +319,9 @@ final class VideoEditor: ObservableObject {
     //   2. 单次请求大概只吃得下 1 分钟音频。四分钟的口播整段喂进去，
     //      后面三分钟直接丢，长片几乎必然没字幕。
     //
-    // 现在改成：先抽 16k 单声道 WAV → 按 45 秒切段 → 逐段识别 →
-    // 把每段的时间轴加回去 → 合并去重。任何一段失败都不影响别的段。
+    // 现在改成：抽 16k 单声道 WAV（顺手做峰值归一化）→ 按 45 秒切段 →
+    // 本地、联网各识别一遍 → 谁的覆盖好就用谁 → 合并去重。
+    // 任何一段失败都不影响别的段。
 
     private func transcribe(_ asset: AVAsset, limit: Double) throws -> [SubtitleCue] {
         try Self.ensureSpeechAuth()
@@ -342,60 +343,85 @@ final class VideoEditor: ObservableObject {
         guard !parts.isEmpty else { throw Fail(msg: "音频切不出来") }
         Diag.note("字幕：音频 \(String(format: "%.1f", audioLen))s，切成 \(parts.count) 段")
 
-        var cues: [SubtitleCue] = []
+        // 本地识别快、离线能用，但真实机器上出现过「开头好几秒在说话它却不出字」；
+        // 联网识别更跟手，可是没网就没辙。所以两遍都跑，谁的覆盖好就用谁。
+        var passes: [(name: String, onDevice: Bool)] = []
+        if rec.supportsOnDeviceRecognition { passes.append(("本地", true)) }
+        passes.append(("联网", false))
+
+        var best: [SubtitleCue] = []
+        var bestName = ""
         var lastErr: Error?
-        var okParts = 0
+
+        for (idx, p) in passes.enumerated() {
+            let base = 0.48 + 0.22 * Double(idx) / Double(passes.count)
+            let span = 0.22 / Double(passes.count)
+            let (cues, ok, err) = runPass(parts, rec: rec, onDevice: p.onDevice,
+                                          progressBase: base, progressSpan: span)
+            if ok == 0 {
+                lastErr = err
+                Diag.note("字幕：\(p.name)识别整轮失败 \(err?.localizedDescription ?? "-")")
+                continue
+            }
+            let merged = Self.sanitize(cues, limit: limit)
+            Diag.note("字幕：\(p.name)成功 \(ok)/\(parts.count) 段，合并 \(merged.count) 条，"
+                      + "覆盖到 \(String(format: "%.1f", merged.last?.end ?? 0))s，"
+                      + "首条从 \(String(format: "%.1f", merged.first?.start ?? -1))s 开始")
+            if Self.score(merged) > Self.score(best) {
+                best = merged
+                bestName = p.name
+            }
+        }
+
+        for piece in parts { try? FileManager.default.removeItem(at: piece.url) }
+
+        if best.isEmpty {
+            throw Fail(msg: lastErr?.localizedDescription ?? "没识别到字幕")
+        }
+        Diag.note("字幕：采用\(bestName)结果，共 \(best.count) 条")
+        return best
+    }
+
+    /// 谁的覆盖更全就听谁的：字多者优先，开头更早的加分。
+    /// 开头漏几秒，一般就是少十几二十个字，字数这一项就能比出来。
+    private static func score(_ cues: [SubtitleCue]) -> Int {
+        guard !cues.isEmpty else { return 0 }
+        let chars = cues.reduce(0) { $0 + $1.text.count }
+        let early = max(0, 30 - Int(cues[0].start)) * 2
+        return chars + early
+    }
+
+    /// 完整跑一遍所有段。哪一段失败不影响别的段，返回成功段数和最后一个错误。
+    private func runPass(_ parts: [Piece],
+                         rec: SFSpeechRecognizer,
+                         onDevice: Bool,
+                         progressBase: Double,
+                         progressSpan: Double) -> (cues: [SubtitleCue], ok: Int, err: Error?) {
+        var cues: [SubtitleCue] = []
+        var ok = 0
+        var lastErr: Error?
 
         for (i, p) in parts.enumerated() {
             do {
-                let got = try recognizeFile(p.url, rec: rec)
-                okParts += 1
-                cues += got.map {
+                let t = try Self.ask(p.url, rec: rec, onDevice: onDevice)
+                ok += 1
+                cues += Self.buildCues(t).map {
                     SubtitleCue(start: $0.start + p.offset,
                                 end: $0.end + p.offset,
                                 text: $0.text)
                 }
-                Diag.note("字幕：第 \(i + 1)/\(parts.count) 段拿到 \(got.count) 条")
+                Diag.note("字幕：\(onDevice ? "本地" : "联网")第 \(i + 1)/\(parts.count) 段 "
+                          + "\(t.segments.count) 小节")
             } catch {
                 lastErr = error
-                Diag.note("字幕：第 \(i + 1)/\(parts.count) 段失败 \(error.localizedDescription)")
+                Diag.note("字幕：\(onDevice ? "本地" : "联网")第 \(i + 1)/\(parts.count) 段失败 "
+                          + "\(error.localizedDescription)")
             }
-            try? FileManager.default.removeItem(at: p.url)
             DispatchQueue.main.async {
-                self.progress = 0.48 + 0.22 * Double(i + 1) / Double(parts.count)
+                self.progress = progressBase + progressSpan * Double(i + 1) / Double(parts.count)
             }
         }
-
-        if cues.isEmpty {
-            throw Fail(msg: lastErr?.localizedDescription ?? "没识别到字幕")
-        }
-        if okParts == 0 { throw Fail(msg: lastErr?.localizedDescription ?? "识别全失败了") }
-
-        let out = Self.sanitize(cues, limit: limit)
-        Diag.note("字幕：合并后 \(out.count) 条，覆盖到 "
-                  + "\(String(format: "%.1f", out.last?.end ?? 0))s")
-        return out
-    }
-
-    /// 一次识别请求。先按「本地识别」跑（快、离线可用），
-    /// 本地没装中文包或者报错，再退回联网识别 —— 两遍都败才认输。
-    private func recognizeFile(_ url: URL, rec: SFSpeechRecognizer) throws -> [SubtitleCue] {
-        var modes: [Bool] = rec.supportsOnDeviceRecognition ? [true, false] : [false]
-        var lastErr: Error?
-
-        while let onDevice = modes.first {
-            modes.removeFirst()
-            do {
-                let t = try Self.ask(url, rec: rec, onDevice: onDevice)
-                return Self.buildCues(t)
-            } catch {
-                lastErr = error
-                Diag.note("字幕：\(onDevice ? "本地" : "联网")识别失败 \(error.localizedDescription)")
-                // 本地这次失败后立刻换联网，识别器有时还没完全松开，稍等一下再发
-                if !modes.isEmpty { Thread.sleep(forTimeInterval: 0.4) }
-            }
-        }
-        throw lastErr ?? Fail(msg: "识别失败")
+        return (cues, ok, lastErr)
     }
 
     private static func ask(_ url: URL,
@@ -423,8 +449,8 @@ final class VideoEditor: ObservableObject {
             if res?.isFinal == true { sem.signal() }
         }
 
-        // 45 秒一段，正常几秒就回；卡到 90 秒就是出问题了，别把整条流程拖死
-        if sem.wait(timeout: .now() + 90) == .timedOut {
+        // 45 秒一段，正常几秒就回；卡到 60 秒就是出问题了，别把整条流程拖死
+        if sem.wait(timeout: .now() + 60) == .timedOut {
             task.cancel()
         }
         // 收尾没回来但过程中已经吐过字，就用最后那版 —— 有字总比一个字都没有强
@@ -433,7 +459,11 @@ final class VideoEditor: ObservableObject {
         throw failed ?? Fail(msg: "这一段没识别出内容")
     }
 
-    /// 从视频里抽 16k 单声道 WAV。语音识别只吃这种最保险。
+    /// 从视频里抽 16k 单声道 WAV，并在写盘前做峰值归一化。
+    ///
+    /// 归一化这一步是给识别器看的：麦克风录出来的片子峰值常常只有 -15dB、
+    /// 平均 -35dB，本地识别模型容易把开头较轻的人声当杂音丢掉，
+    /// 现象就是「开头好几秒在说话却没有字幕」。抬到 -3dB 左右再喂，稳得多。
     private func extractAudio(_ asset: AVAsset, to out: URL) throws -> Double {
         guard let aTrack = asset.tracks(withMediaType: .audio).first else {
             throw Fail(msg: "这个视频里没有声音，识别不了")
@@ -458,6 +488,39 @@ final class VideoEditor: ObservableObject {
         reader.add(trackOut)
         guard reader.startReading() else { throw Fail(msg: "读音轨失败") }
 
+        // 全部读进内存再统一处理。5 分钟的片子也就 20MB，扛得住。
+        var samples: [Float] = []
+        samples.reserveCapacity(Int(sr) * 300)
+        while let sb = trackOut.copyNextSampleBuffer() {
+            guard let bb = CMSampleBufferGetDataBuffer(sb) else { continue }
+            let len = CMBlockBufferGetDataLength(bb)
+            let n = len / 4
+            if n <= 0 { continue }
+            var tmp = [Float](repeating: 0, count: n)
+            let st = tmp.withUnsafeMutableBytes { raw -> OSStatus in
+                guard let base = raw.baseAddress else { return -1 }
+                return CMBlockBufferCopyDataBytes(bb, atOffset: 0, dataLength: len, destination: base)
+            }
+            if st == noErr { samples.append(contentsOf: tmp) }
+        }
+
+        let secs = Double(samples.count) / sr
+        guard secs > 0.3 else { throw Fail(msg: "音轨是空的") }
+
+        // 峰值归一化到 -3dBFS（0.7），最多放大 30dB，免得纯底噪被抬成「伪人声」
+        var peak: Float = 0
+        for v in samples { let a = abs(v); if a > peak { peak = a } }
+        var gain: Float = 1
+        if peak > 1e-5 { gain = min(0.7 / peak, 32) }
+        if gain > 1.05 {
+            for i in samples.indices {
+                let v = samples[i] * gain
+                samples[i] = max(-1, min(1, v))
+            }
+            Diag.note("字幕：识别前放大 \(Int((20 * log10(Double(gain))).rounded()))dB，"
+                      + "原峰值 \(String(format: "%.1f", 20 * log10(Double(peak))))dB")
+        }
+
         let fileSettings: [String: Any] = [
             AVFormatIDKey: kAudioFormatLinearPCM,
             AVSampleRateKey: sr,
@@ -473,27 +536,19 @@ final class VideoEditor: ObservableObject {
                                    commonFormat: .pcmFormatFloat32,
                                    interleaved: false)
 
-        var frames: AVAudioFramePosition = 0
-        while let sb = trackOut.copyNextSampleBuffer() {
-            guard let bb = CMSampleBufferGetDataBuffer(sb) else { continue }
-            let len = CMBlockBufferGetDataLength(bb)
-            let n = len / 4
-            if n <= 0 { continue }
+        let cap = 320_000
+        var off = 0
+        while off < samples.count {
+            let n = min(cap, samples.count - off)
             guard let buf = AVAudioPCMBuffer(pcmFormat: fmt,
-                                             frameCapacity: AVAudioFrameCount(n)) else { continue }
-            let ptr = UnsafeMutablePointer<Int8>.allocate(capacity: len)
-            defer { ptr.deallocate() }
-            if CMBlockBufferCopyDataBytes(bb, atOffset: 0, dataLength: len, destination: ptr) != noErr {
-                continue
+                                             frameCapacity: AVAudioFrameCount(n)) else { break }
+            samples.withUnsafeBufferPointer { src in
+                buf.floatChannelData![0].update(from: src.baseAddress! + off, count: n)
             }
-            memcpy(buf.floatChannelData![0], ptr, len)
             buf.frameLength = AVAudioFrameCount(n)
             try file.write(from: buf)
-            frames += AVAudioFramePosition(n)
+            off += n
         }
-
-        let secs = Double(frames) / sr
-        if secs <= 0 { throw Fail(msg: "音轨是空的") }
         return secs
     }
 

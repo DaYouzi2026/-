@@ -142,7 +142,7 @@ struct EditorView: View {
 
             toggleRow(icon: "text.bubble",
                       title: "自动字幕",
-                      sub: "识别口播内容，烧进画面。耗时最长，一般等于视频长度的一半",
+                      sub: "识别口播内容，烧进画面。会本地、联网各识别一遍取效果好的，耗时最长，一般等于视频长度",
                       isOn: $subtitle)
 
             if subtitle {
