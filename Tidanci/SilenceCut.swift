@@ -17,65 +17,49 @@ enum SilenceCut {
 
     // MARK: - 有没有声音
 
-    /// 音轨的最大音量（dB）。文件里挂着音轨、但采样全是 0 时，播放一样是没声音，
-    /// 光看「有没有音轨」看不出来 —— 所以补音之前要拿它确认一遍。
-    static func peakDb(_ url: URL, maxSeconds: Double = 45) -> Float {
-        let asset = AVURLAsset(url: url)
-        guard let track = asset.tracks(withMediaType: .audio).first,
-              let reader = try? AVAssetReader(asset: asset) else { return -120 }
-        reader.timeRange = CMTimeRange(start: .zero,
-                                       duration: CMTime(seconds: maxSeconds, preferredTimescale: 600))
-        let settings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatLinearPCM,
-            AVLinearPCMBitDepthKey: 32,
-            AVLinearPCMIsFloatKey: true,
-            AVLinearPCMIsNonInterleaved: false,
-            AVSampleRateKey: sampleRate,
-            AVNumberOfChannelsKey: 1
-        ]
-        let out = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
-        out.alwaysCopiesSampleData = false
-        guard reader.canAdd(out) else { return -120 }
-        reader.add(out)
-        guard reader.startReading() else { return -120 }
-
-        let win = Int(sampleRate * windowSec)
+    /// 一条音轨的体检结果
+    struct AudioStats {
+        /// 音轨自身长度（秒）
+        var duration: Double = 0
+        /// 整条音轨的最大音量
         var peak: Float = -120
-        var carry: [Float] = []
-
-        while let sb = out.copyNextSampleBuffer() {
-            guard let bb = CMSampleBufferGetDataBuffer(sb) else { continue }
-            let len = CMBlockBufferGetDataLength(bb)
-            guard len >= 4 else { continue }
-            var data = [Float](repeating: 0, count: len / 4)
-            let st = data.withUnsafeMutableBytes { raw -> OSStatus in
-                guard let base = raw.baseAddress else { return -1 }
-                return CMBlockBufferCopyDataBytes(bb, atOffset: 0, dataLength: len, destination: base)
-            }
-            guard st == noErr else { continue }
-            carry.append(contentsOf: data)
-            var i = 0
-            while carry.count - i >= win {
-                var sum: Float = 0
-                for k in i..<(i + win) { sum += carry[k] * carry[k] }
-                let rms = (sum / Float(win)).squareRoot()
-                peak = max(peak, 20 * log10(max(rms, 1e-7)))
-                i += win
-            }
-            if i > 0 { carry.removeFirst(i) }
-        }
-        return peak
+        /// 最后一段（默认末尾四分之一）的最大音量。全程峰值看不出来的「录到一半哑了」靠它。
+        var tail: Float = -120
+        /// 20ms 窗口数，0 表示压根没解出声音
+        var windows: Int = 0
     }
 
-    // MARK: - 检测
+    /// 音轨的最大音量（dB）。文件里挂着音轨、但采样全是 0 时，播放一样是没声音，
+    /// 光看「有没有音轨」看不出来 —— 所以补音之前要拿它确认一遍。
+    ///
+    /// v1.14：默认改成扫全程。旧版只扫前 45 秒，四分钟的片子后半段哑了它照样报「正常」，
+    /// 于是「这条片子看着没问题」被原样留下 —— 用户听到的就是没声音。
+    static func peakDb(_ url: URL, maxSeconds: Double = 0) -> Float {
+        stats(url, maxSeconds: maxSeconds).peak
+    }
 
-    static func detect(_ url: URL,
-                       thresholdDb: Float = -38,
-                       minSilence: Double = 0.45) throws -> [SilenceGap] {
+    /// 全程扫一遍，给出「总长度 / 全局峰值 / 尾巴峰值」。
+    static func stats(_ url: URL, tailRatio: Double = 0.25, maxSeconds: Double = 0) -> AudioStats {
+        let scan = scanLevels(url, maxSeconds: maxSeconds)
+        var s = AudioStats(duration: scan.trackDuration, peak: -120, tail: -120, windows: scan.levels.count)
+        guard !scan.levels.isEmpty else { return s }
+        s.peak = scan.levels.max() ?? -120
+        let start = max(0, Int(Double(scan.levels.count) * (1 - tailRatio)))
+        s.tail = scan.levels[start...].max() ?? -120
+        return s
+    }
+
+    private static func scanLevels(_ url: URL,
+                                   maxSeconds: Double = 0)
+        -> (levels: [Float], trackDuration: Double) {
         let asset = AVURLAsset(url: url)
-        guard let track = asset.tracks(withMediaType: .audio).first else { return [] }
-        guard let reader = try? AVAssetReader(asset: asset) else { return [] }
-
+        guard let track = asset.tracks(withMediaType: .audio).first,
+              let reader = try? AVAssetReader(asset: asset) else { return ([], 0) }
+        let dur = track.timeRange.duration.seconds
+        if maxSeconds > 0 {
+            reader.timeRange = CMTimeRange(start: .zero,
+                                           duration: CMTime(seconds: maxSeconds, preferredTimescale: 600))
+        }
         let settings: [String: Any] = [
             AVFormatIDKey: kAudioFormatLinearPCM,
             AVLinearPCMBitDepthKey: 32,
@@ -86,9 +70,9 @@ enum SilenceCut {
         ]
         let out = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
         out.alwaysCopiesSampleData = false
-        guard reader.canAdd(out) else { return [] }
+        guard reader.canAdd(out) else { return ([], dur) }
         reader.add(out)
-        guard reader.startReading() else { return [] }
+        guard reader.startReading() else { return ([], dur) }
 
         let win = Int(sampleRate * windowSec)
         var levels: [Float] = []
@@ -118,7 +102,15 @@ enum SilenceCut {
             }
             if i > 0 { carry.removeFirst(i) }
         }
+        return (levels, dur)
+    }
 
+    // MARK: - 检测
+
+    static func detect(_ url: URL,
+                       thresholdDb: Float = -38,
+                       minSilence: Double = 0.45) throws -> [SilenceGap] {
+        let levels = scanLevels(url).levels
         guard !levels.isEmpty else { return [] }
 
         var gaps: [SilenceGap] = []

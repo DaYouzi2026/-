@@ -74,6 +74,13 @@ final class CameraRecorder: NSObject, ObservableObject {
     /// 第一个音频帧比录制开始晚多少秒，补音时要把音频往后挪这么多
     private var backupOffset: Double = 0
     private var recordStartAt: CFTimeInterval = 0
+    /// 第一帧音频的 PTS（秒）。备份的时间轴从这里起算，缺帧处补静音，
+    /// 这样备份的长度、节奏和视频严格一致 —— 长录制才不会越到后面越不同步。
+    private var firstAudioPts: Double = -1
+    /// 因为丢帧补进去的静音帧数，进诊断
+    private var backupPadFrames = 0
+    /// 中途采样率/声道变了（理论上不会），只记一次
+    private var backupFmtWarned = false
 
     /// 录制中盯着麦克风：太久没收到音频就把音频环境重新激活一次
     private var audioWatch: DispatchSourceTimer?
@@ -235,7 +242,50 @@ final class CameraRecorder: NSObject, ObservableObject {
 
     // MARK: - 配置
 
+    // MARK: - 相机会话被系统打断
+
+    private var observingSession = false
+
+    /// 来电、别的 App 抢麦、切后台回来，都会让会话中断一次 —— 中断期间音频这条路
+    /// 直接停掉，画面照走。以前这种断流只能等看门狗每 1.5 秒摸一次，摸不回来就整段哑。
+    /// 现在把系统的中断/错误通知接上：停下来的时候把会话重新拉起来，下一段就正常。
+    private func observeSessionIfNeeded() {
+        guard !observingSession else { return }
+        observingSession = true
+        let c = NotificationCenter.default
+        c.addObserver(forName: AVCaptureSession.wasInterruptedNotification,
+                      object: session, queue: nil) { _ in
+            Diag.note("相机会话被中断（录音会停，这一段靠备份兜）")
+        }
+        c.addObserver(forName: AVCaptureSession.interruptionEndedNotification,
+                      object: session, queue: nil) { [weak self] _ in
+            guard let self else { return }
+            Diag.note("相机会话中断结束")
+            self.cfgQ.async {
+                // 录制中不动 session：startRunning 会把当前这段录制提前收尾，
+                // 四分钟的片子就废了。等停下再重启，下一段自然正常。
+                if !self.session.isRunning, !self.movieOut.isRecording {
+                    self.session.startRunning()
+                }
+                AudioSession.enforceForCamera()
+            }
+        }
+        c.addObserver(forName: AVCaptureSession.runtimeErrorNotification,
+                      object: session, queue: nil) { [weak self] note in
+            guard let self else { return }
+            let code = (note.userInfo?[AVCaptureSessionErrorKey] as? NSError)?.code ?? 0
+            Diag.note("相机会话运行时错误 code=\(code)")
+            self.cfgQ.async {
+                if !self.movieOut.isRecording, !self.session.isRunning {
+                    self.session.startRunning()
+                }
+                AudioSession.enforceForCamera()
+            }
+        }
+    }
+
     private func configure(front: Bool) {
+        observeSessionIfNeeded()
         AudioSession.forCamera()
 
         session.beginConfiguration()
@@ -641,6 +691,9 @@ final class CameraRecorder: NSObject, ObservableObject {
             self.backupOn = true
             self.closeBackupFile()
             self.backupFrames = 0
+            self.backupPadFrames = 0
+            self.firstAudioPts = -1
+            self.backupFmtWarned = false
             self.offsetFixed = false
             self.backupOffset = 0
             self.recordStartAt = CACurrentMediaTime()
@@ -688,8 +741,11 @@ final class CameraRecorder: NSObject, ObservableObject {
 
     private func closeBackupFile() {
         if let h = backupHandle {
-            // 回填 WAV 头
-            let dataBytes = backupFrames * backupChannels * 2
+            // 回填 WAV 头。长度按「实际写进去的总帧数」算（含补的静音），
+            // 否则文件里音频比声明长/短，读出来会截断或爆音。
+            let raw = backupFrames * backupChannels * 2
+            // WAV 的长度字段是 32 位，超了要截：宁可文件短一点，也不能溢出崩溃
+            let dataBytes = min(raw, Int(UInt32.max) - 64)
             var head = Data()
             func le32(_ v: UInt32) { var x = v.littleEndian; withUnsafeBytes(of: &x) { head.append(contentsOf: $0) } }
             func le16(_ v: UInt16) { var x = v.littleEndian; withUnsafeBytes(of: &x) { head.append(contentsOf: $0) } }
@@ -710,6 +766,10 @@ final class CameraRecorder: NSObject, ObservableObject {
             try? h.write(contentsOf: head)
             try? h.close()
             backupHandle = nil
+
+            Diag.note("备份：\(Int(backupRate))Hz/\(backupChannels)ch 共 "
+                      + String(format: "%.1f", Double(backupFrames) / max(1, backupRate))
+                      + "s（其中补静音 \(String(format: "%.1f", Double(backupPadFrames) / max(1, backupRate)))s）")
         }
     }
 
@@ -733,15 +793,43 @@ final class CameraRecorder: NSObject, ObservableObject {
 
     /// 把一帧 PCM 追加成 16 位小端。任何看不懂的格式直接放弃备份，
     /// 绝不在这里赌异常（赌输就是闪退）。
-    private func appendAudioBackup(_ pcm: AVAudioPCMBuffer) {
+    ///
+    /// v1.14：按 PTS 对齐写入。旧版是「来一帧写一帧」，中途什么时候断过、断了多久
+    /// 完全不知道，备份就成了压缩过的音轨 —— 补进四分钟的成片里，越到后面越对不上嘴。
+    /// 现在每一帧都按它自己的时间戳落位，中间的空洞补静音，时间轴和视频一模一样。
+    private func appendAudioBackup(_ pcm: AVAudioPCMBuffer, pts: CMTime) {
         guard backupOn, let h = backupHandle else { return }
         let fmt = pcm.format
         let frames = Int(pcm.frameLength)
         let ch = Int(fmt.channelCount)
         guard frames > 0, ch > 0, fmt.sampleRate > 8000 else { return }
 
-        backupRate = fmt.sampleRate
-        backupChannels = ch
+        let ptsSec = pts.isValid && pts.seconds.isFinite ? pts.seconds : CACurrentMediaTime()
+        if firstAudioPts < 0 {
+            // 第一帧定死格式和起点，之后不再改：改采样率等于把已写进去的时间轴推翻
+            firstAudioPts = ptsSec
+            backupRate = fmt.sampleRate
+            backupChannels = ch
+            if !offsetFixed {
+                offsetFixed = true
+                backupOffset = max(0, min(1.5, ptsSec - recordStartAt))
+            }
+        } else if abs(fmt.sampleRate - backupRate) > 1 || ch != backupChannels {
+            if !backupFmtWarned {
+                backupFmtWarned = true
+                Diag.note("备份格式中途变了：\(Int(fmt.sampleRate))Hz/\(ch)ch，这一帧跳过")
+            }
+            return
+        }
+
+        // 这个空洞最多补到 15 分钟，PTS 要是抽风也不会写出几十个 G
+        let rel = max(0, ptsSec - firstAudioPts)
+        let want = Int((rel * backupRate).rounded())
+        let pad = min(want - backupFrames, Int(backupRate) * 900)
+        if pad > Int(backupRate * 0.02) {
+            writeZeros(pad, channels: backupChannels, handle: h)
+            backupPadFrames += pad
+        }
 
         var data = Data()
         data.reserveCapacity(frames * ch * 2)
@@ -771,28 +859,53 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
 
         if !data.isEmpty {
-            try? h.write(contentsOf: data)
-            backupFrames += frames
+            do {
+                try h.write(contentsOf: data)
+                backupFrames += frames
+            } catch {
+                // 写失败（磁盘满 / 句柄被系统回收）以前是 try? 悄悄吞掉，
+                // 结果备份停在半截，补出来的成片后半段没声 —— 记下来
+                Diag.note("备份写入失败：\(error.localizedDescription)")
+                backupOn = false
+                return
+            }
         }
 
-        let now = CACurrentMediaTime()
-        if !offsetFixed {
-            offsetFixed = true
-            backupOffset = max(0, min(1.5, now - recordStartAt))
+        lastAudioAt = CACurrentMediaTime()
+    }
+
+    private func writeZeros(_ frames: Int, channels: Int, handle h: FileHandle) {
+        let bytes = frames * channels * 2
+        guard bytes > 0 else { return }
+        let chunk = 32768
+        let zero = Data(count: min(bytes, chunk))
+        var left = bytes
+        while left > 0 {
+            let n = min(left, chunk)
+            do {
+                try h.write(contentsOf: n == chunk ? zero : Data(zero.prefix(n)))
+            } catch {
+                // 只把真写进去的那部分算进长度，否则 WAV 头会比文件长，读出来是破的
+                backupFrames += (bytes - left) / max(1, channels * 2)
+                Diag.note("补静音失败：\(error.localizedDescription)")
+                backupOn = false
+                return
+            }
+            left -= n
         }
-        lastAudioAt = now
+        backupFrames += frames
     }
 
     /// 用备份 PCM 当音轨，重新合成一条成片。
     ///
-    /// ── v1.13：判断条件反过来了 ───────────────────────────────
-    /// 旧版是「成片音轨没声音，才用备份补」。结果碰上最难受的一种情况：
-    /// 录三秒有声、后面越来越小直到没有（编码器 backpressure 时音频样本被
-    /// `isReadyForMoreMediaData` 一路丢掉），成片音轨的**峰值还是正常的**，
-    /// 于是判定「视频没问题」，一条只有前几秒有声的成片就被放过了。
+    /// ── v1.14：判据改成看「尾巴」 ─────────────────────────────
+    /// v1.13 用「音轨时长 < 视频 92% 或 峰值静音」判断成片坏没坏。四分钟的片子
+    /// 在这两条上都能蒙混过关：
+    ///   · 峰值只扫前 45 秒 —— 前 45 秒有声，峰值就是正常的；
+    ///   · 编码器一路写静音样本，音轨时长照样是满的。
+    /// 于是「看起来没问题」被原样留下，用户听到的是从头到尾没声音。
     ///
-    /// 现在只要备份里真的有声音，就以备份为准重做音轨——备份是从录制第一帧开始
-    /// 原样写的 PCM，不经过编码器，不会中途断。
+    /// 现在看末尾四分之一的音量：成片尾巴是死的、备份尾巴有声，一律以备份为准重做。
     private func repairAudioIfNeeded(_ video: URL, done: @escaping (URL?) -> Void) {
         endAudioBackup { backup, offset in
             guard let b = backup else {
@@ -801,50 +914,62 @@ final class CameraRecorder: NSObject, ObservableObject {
                 return
             }
             DispatchQueue.global(qos: .userInitiated).async {
-                let backupPeak = SilenceCut.peakDb(b)
+                let bs = SilenceCut.stats(b)
                 let asset = AVURLAsset(url: video)
                 let aTrack = asset.tracks(withMediaType: .audio).first
                 let vLen = asset.duration.seconds
-                let aLen = aTrack?.timeRange.duration.seconds ?? 0
-                let videoPeak = aTrack == nil ? -100 : SilenceCut.peakDb(video)
-                // 判断成片音轨「完整不完整」，不能只看峰值：
-                // 前几秒有声、后面被编码器丢光的片子，峰值照样是正常的。
-                let broken = (aTrack == nil)
-                    || (aLen < vLen * 0.92)
-                    || videoPeak <= -52
-                let trackText: String
+                let vs = aTrack == nil ? SilenceCut.AudioStats() : SilenceCut.stats(video)
+
+                // 成片音轨的四种坏法：没有、比视频短一截、整体静音、尾巴是死的。
+                // 阈值从 92% 收到 97%：四分钟的片子断在 3 分半，92% 是判不出来的。
+                let short = vs.duration < vLen * 0.97
+                let deadTail = vs.tail <= -50 && bs.tail > -50
+                let broken = (aTrack == nil) || short || vs.peak <= -52 || deadTail
+
+                let vText: String
                 if aTrack == nil {
-                    trackText = "无"
+                    vText = "无"
                 } else {
-                    trackText = String(format: "%.1fs/%.0fdB", aLen, videoPeak)
+                    vText = String(format: "%.1fs/%.0fdB/尾%.0fdB", vs.duration, vs.peak, vs.tail)
                 }
-                Diag.note("结束：帧=\(self.audioFrameCount) 备份峰值=\(Int(backupPeak))dB "
-                          + "成片音轨=\(trackText) 视频=\(String(format: "%.1fs", vLen))")
+                Diag.note("结束：帧=\(self.audioFrameCount) 备份="
+                          + String(format: "%.1fs/%.0fdB/尾%.0fdB", bs.duration, bs.peak, bs.tail)
+                          + " 成片音轨=\(vText) 视频="
+                          + String(format: "%.1fs", vLen)
+                          + " 判定=\(broken ? "需补音" : "正常")")
+
                 DispatchQueue.main.async {
                     // 备份也是哑的：麦克风整条路没通，补也补不出声音，别白等一轮合成
-                    guard backupPeak > -52 else {
+                    guard bs.peak > -52 else {
                         self.recordingError = "这条没录到声音（麦克风没出数据），建议重录"
                         done(video)
                         return
                     }
-                    // 成片音轨完整就原样留着：重新合成本身会带来几帧的音画偏移，
-                    // 没必要为了「更保险」把好片子也动一遍。
-                    guard broken else {
-                        done(video)
-                        return
-                    }
-                    self.mux(video: video, audio: b, offset: offset, done: done)
+                    // 成片看着没问题也照样用备份重建：直通合成只要一两秒，
+                    // 视频一个像素都不动。相机那条音轨太不可靠了 —— 诊断里
+                    // 「成片音轨=无」是常态，与其赌它这次写对了，不如统一用备份。
+                    self.mux(video: video, audio: b, offset: offset, mustFix: broken, done: done)
                 }
             }
         }
     }
 
-    private func mux(video: URL, audio: URL, offset: Double, done: @escaping (URL?) -> Void) {
+    private func mux(video: URL, audio: URL, offset: Double,
+                     mustFix: Bool, done: @escaping (URL?) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             // ① 备份是 WAV（PCM），mp4 容器装不了。先单独编码成 AAC——
             //    只要音轨是 AAC，整个片子就能走 passthrough：视频一个像素都不重编码。
             //    旧版一律 HighestQuality，4K 片子要重压十几秒，用户以为卡死了。
+            let t0 = CACurrentMediaTime()
             let aac = self.encodeAAC(audio)
+            Diag.note("音频准备：AAC \(aac == nil ? "失败" : "成功")，耗时 "
+                      + String(format: "%.1fs", CACurrentMediaTime() - t0))
+            if aac == nil, !mustFix {
+                // 编码没成、成片音轨又是好的：没必要为了保险去重压一条四分钟的 4K
+                Diag.note("AAC 失败但成片音轨正常，保持原样")
+                DispatchQueue.main.async { done(video) }
+                return
+            }
             let source = aac ?? audio
 
             let comp = AVMutableComposition()
@@ -887,16 +1012,22 @@ final class CameraRecorder: NSObject, ObservableObject {
                 .appendingPathComponent("tidanci-fix-\(UUID().uuidString).\(ext)")
             let fileType: AVFileType = ext == "mov" ? .mov : .mp4
 
-            // ② 先试直通（快），直通被容器/机型拒了再退重编码（慢但一定能出）
+            // ② 先试直通（快），直通被容器/机型拒了再退重编码（慢但一定能出）。
+            //    四分钟的 4K 片子直通是秒级，重编码要几分钟——所以两者给不同的等待上限。
             var out = self.export(comp, to: tmp, fileType: fileType,
-                                  preset: AVAssetExportPresetPassthrough)
+                                  preset: AVAssetExportPresetPassthrough, timeout: 180)
             if out == nil {
+                Diag.note("直通合成没成功，改走重编码（这条会慢一些）")
                 out = self.export(comp, to: tmp, fileType: fileType,
-                                  preset: AVAssetExportPresetHighestQuality)
+                                  preset: AVAssetExportPresetHighestQuality, timeout: 600)
             }
 
             guard let ok = out else {
-                DispatchQueue.main.async { done(video) }
+                Diag.note("补音失败：合成没有产出文件，成片保持原样（没声音）")
+                DispatchQueue.main.async {
+                    self.recordingError = "这条没补上声音，检查下手机存储再重录一次"
+                    done(video)
+                }
                 return
             }
 
@@ -904,8 +1035,22 @@ final class CameraRecorder: NSObject, ObservableObject {
             do {
                 _ = try FileManager.default.replaceItemAt(video, withItemAt: ok)
             } catch {
-                replaced = false
-                Diag.note("合成完成但替换失败：\(error.localizedDescription)")
+                // 原子替换在「原文件还被相册/系统占着」或者空间不够时会失败。
+                // 退一步：先把新文件搬进同一个目录（同卷 rename，几乎不会失败），
+                // 再删原文件改名。四分钟的片子体积大，这一步比以前更容易踩到。
+                Diag.note("原子替换失败：\(error.localizedDescription)，改走改名替换")
+                let dir = video.deletingLastPathComponent()
+                let staged = dir.appendingPathComponent("tidanci-stage-\(UUID().uuidString)")
+                    .appendingPathExtension(video.pathExtension.isEmpty ? "mp4" : video.pathExtension)
+                do {
+                    try FileManager.default.moveItem(at: ok, to: staged)
+                    try? FileManager.default.removeItem(at: video)
+                    try FileManager.default.moveItem(at: staged, to: video)
+                } catch {
+                    replaced = false
+                    try? FileManager.default.removeItem(at: staged)
+                    Diag.note("改名替换也失败：\(error.localizedDescription)")
+                }
             }
             DispatchQueue.main.async {
                 // 成功就静默——用户只需要听到声音，不需要知道过程
@@ -917,15 +1062,23 @@ final class CameraRecorder: NSObject, ObservableObject {
 
     /// 同步导出（调用方已经在后台队列上，不会卡界面）
     private func export(_ asset: AVAsset, to url: URL,
-                        fileType: AVFileType, preset: String) -> URL? {
+                        fileType: AVFileType, preset: String,
+                        timeout: TimeInterval = 180) -> URL? {
         try? FileManager.default.removeItem(at: url)
         guard let ex = AVAssetExportSession(asset: asset, presetName: preset) else { return nil }
         ex.outputURL = url
         ex.outputFileType = fileType
-        ex.shouldOptimizeForNetworkUse = true
+        // 相册播放用不上 moov 前置，关掉能少一次整文件重排
+        ex.shouldOptimizeForNetworkUse = false
         let sem = DispatchSemaphore(value: 0)
         ex.exportAsynchronously { sem.signal() }
-        sem.wait()
+        // 旧版是死等：四分钟的片子万一卡在导出，这个后台队列就永远不回来了，
+        // 成片一直不出现，用户以为「录完就没了」
+        if sem.wait(timeout: .now() + timeout) == .timedOut {
+            ex.cancelExport()
+            Diag.note("导出超时（\(preset)，\(Int(timeout))s）")
+            return nil
+        }
         if ex.status == .completed, FileManager.default.fileExists(atPath: url.path) {
             return url
         }
@@ -934,11 +1087,95 @@ final class CameraRecorder: NSObject, ObservableObject {
     }
 
     /// WAV → AAC(m4a)
+    ///
+    /// 不走 AVAssetExportSession：它对长音频（四分钟）是整段解码再编码，
+    /// 中间既没有进度也没法干预，失败原因还只给一句含糊的话。
+    /// 这里用 reader + writer 一段一段推，硬件编码，四分钟音频一两秒完事。
     private func encodeAAC(_ wav: URL) -> URL? {
         let out = FileManager.default.temporaryDirectory
             .appendingPathComponent("tidanci-aac-\(UUID().uuidString).m4a")
-        return export(AVURLAsset(url: wav), to: out, fileType: .m4a,
-                      preset: AVAssetExportPresetAppleM4A)
+        try? FileManager.default.removeItem(at: out)
+
+        let asset = AVURLAsset(url: wav)
+        guard let track = asset.tracks(withMediaType: .audio).first,
+              let reader = try? AVAssetReader(asset: asset) else {
+            Diag.note("AAC：读不到 WAV 音轨")
+            return nil
+        }
+
+        var rate: Double = 48000
+        var ch = 1
+        if let fd = track.formatDescriptions.first {
+            let afd = fd as! CMAudioFormatDescription
+            if let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(afd) {
+                if asbd.pointee.mSampleRate > 8000 { rate = asbd.pointee.mSampleRate }
+                if asbd.pointee.mChannelsPerFrame > 0 { ch = Int(asbd.pointee.mChannelsPerFrame) }
+            }
+        }
+
+        let readerOut = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsNonInterleaved: false
+        ])
+        guard reader.canAdd(readerOut) else {
+            Diag.note("AAC：reader 加不上输出")
+            return nil
+        }
+        reader.add(readerOut)
+
+        guard let writer = try? AVAssetWriter(outputURL: out, fileType: .m4a) else {
+            Diag.note("AAC：writer 打不开")
+            return nil
+        }
+        let input = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: rate,
+            AVNumberOfChannelsKey: ch,
+            AVEncoderBitRateKey: 96000
+        ])
+        input.expectsMediaDataInRealTime = false
+        guard writer.canAdd(input) else {
+            Diag.note("AAC：writer 加不上输入")
+            return nil
+        }
+        writer.add(input)
+
+        guard reader.startReading(), writer.startWriting() else {
+            Diag.note("AAC：启动失败 \(reader.error?.localizedDescription ?? "-") "
+                      + "\(writer.error?.localizedDescription ?? "-")")
+            return nil
+        }
+        writer.startSession(atSourceTime: .zero)
+
+        var chunks = 0
+        while writer.status == .writing {
+            if input.isReadyForMoreMediaData {
+                if let sb = readerOut.copyNextSampleBuffer() {
+                    if input.append(sb) { chunks += 1 }
+                } else {
+                    input.markAsFinished()
+                    break
+                }
+            } else {
+                Thread.sleep(forTimeInterval: 0.004)
+            }
+        }
+
+        let sem = DispatchSemaphore(value: 0)
+        writer.finishWriting { sem.signal() }
+        if sem.wait(timeout: .now() + 120) == .timedOut {
+            writer.cancelWriting()
+            Diag.note("AAC：收尾超时")
+            return nil
+        }
+        guard writer.status == .completed else {
+            Diag.note("AAC：写入失败 \(writer.error?.localizedDescription ?? "-")")
+            return nil
+        }
+        Diag.note("AAC：\(Int(rate))Hz/\(ch)ch \(chunks) 段")
+        return out
     }
 
     private func handleAudio(_ sb: CMSampleBuffer) {
@@ -960,7 +1197,9 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
 
         if let pcm = CameraRecorder.toPCM(sb) {
-            if backupOn { appendAudioBackup(pcm) }
+            if backupOn {
+                appendAudioBackup(pcm, pts: CMSampleBufferGetPresentationTimeStamp(sb))
+            }
             onAudio?(pcm)
         }
     }
