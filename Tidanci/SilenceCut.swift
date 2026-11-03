@@ -40,26 +40,68 @@ enum SilenceCut {
 
     /// 全程扫一遍，给出「总长度 / 全局峰值 / 尾巴峰值」。
     static func stats(_ url: URL, tailRatio: Double = 0.25, maxSeconds: Double = 0) -> AudioStats {
-        let scan = scanLevels(url, maxSeconds: maxSeconds)
-        var s = AudioStats(duration: scan.trackDuration, peak: -120, tail: -120, windows: scan.levels.count)
-        guard !scan.levels.isEmpty else { return s }
-        s.peak = scan.levels.max() ?? -120
-        let start = max(0, Int(Double(scan.levels.count) * (1 - tailRatio)))
-        s.tail = scan.levels[start...].max() ?? -120
+        let dur = trackDuration(url)
+        let scan = levelSeries(url, start: 0,
+                               duration: maxSeconds > 0 ? min(maxSeconds, dur) : dur)
+        var s = AudioStats(duration: dur, peak: -120, tail: -120, windows: scan.count)
+        guard !scan.isEmpty else { return s }
+        s.peak = scan.max() ?? -120
+        let start = max(0, Int(Double(scan.count) * (1 - tailRatio)))
+        s.tail = scan[start...].max() ?? -120
         return s
+    }
+
+    /// 抽样式体检：只解「开头 headSeconds 秒 + 末尾 tailRatio」。
+    ///
+    /// 全程扫一条四分钟的 AAC 音轨，要把整段解码成 PCM，光这一步就要好几秒，
+    /// 用户只能盯着「正在整理音轨」干等。可实际上只有两件事要判断：
+    /// 整条是不是哑的（听开头就知道），后半段有没有断（听尾巴就知道）。
+    /// 备份是未压缩的 WAV，仍然全程扫——它才是「到底有没有录到声音」的证据。
+    static func statsSampled(_ url: URL,
+                             headSeconds: Double = 12,
+                             tailRatio: Double = 0.40) -> AudioStats {
+        let dur = trackDuration(url)
+        guard dur > 0 else { return AudioStats() }
+        let head = levelSeries(url, start: 0, duration: min(headSeconds, dur))
+        let tailStart = max(0, dur * (1 - tailRatio))
+        // 片子还没 headSeconds 长，或者尾巴已经和开头重叠：扫一次就够了
+        let tail: [Float]
+        if tailStart <= headSeconds {
+            tail = head
+        } else {
+            tail = levelSeries(url, start: tailStart, duration: dur - tailStart)
+        }
+        var s = AudioStats(duration: dur, peak: -120, tail: -120,
+                           windows: head.count + tail.count)
+        s.peak = max(head.max() ?? -120, tail.max() ?? -120)
+        s.tail = tail.max() ?? -120
+        return s
+    }
+
+    /// 音轨长度。直接读元数据，不用解码。
+    private static func trackDuration(_ url: URL) -> Double {
+        let asset = AVURLAsset(url: url)
+        guard let t = asset.tracks(withMediaType: .audio).first else { return 0 }
+        return t.timeRange.duration.seconds
     }
 
     private static func scanLevels(_ url: URL,
                                    maxSeconds: Double = 0)
         -> (levels: [Float], trackDuration: Double) {
+        let dur = trackDuration(url)
+        let scan = levelSeries(url, start: 0,
+                               duration: maxSeconds > 0 ? min(maxSeconds, dur) : dur)
+        return (scan, dur)
+    }
+
+    /// 解出 [start, start+duration) 这段音频，返回每 20ms 一个的 dB 值
+    private static func levelSeries(_ url: URL, start: Double, duration: Double) -> [Float] {
+        guard duration > 0.05 else { return [] }
         let asset = AVURLAsset(url: url)
         guard let track = asset.tracks(withMediaType: .audio).first,
-              let reader = try? AVAssetReader(asset: asset) else { return ([], 0) }
-        let dur = track.timeRange.duration.seconds
-        if maxSeconds > 0 {
-            reader.timeRange = CMTimeRange(start: .zero,
-                                           duration: CMTime(seconds: maxSeconds, preferredTimescale: 600))
-        }
+              let reader = try? AVAssetReader(asset: asset) else { return [] }
+        reader.timeRange = CMTimeRange(start: CMTime(seconds: start, preferredTimescale: 600),
+                                       duration: CMTime(seconds: duration, preferredTimescale: 600))
         let settings: [String: Any] = [
             AVFormatIDKey: kAudioFormatLinearPCM,
             AVLinearPCMBitDepthKey: 32,
@@ -70,9 +112,9 @@ enum SilenceCut {
         ]
         let out = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
         out.alwaysCopiesSampleData = false
-        guard reader.canAdd(out) else { return ([], dur) }
+        guard reader.canAdd(out) else { return [] }
         reader.add(out)
-        guard reader.startReading() else { return ([], dur) }
+        guard reader.startReading() else { return [] }
 
         let win = Int(sampleRate * windowSec)
         var levels: [Float] = []
@@ -102,7 +144,7 @@ enum SilenceCut {
             }
             if i > 0 { carry.removeFirst(i) }
         }
-        return (levels, dur)
+        return levels
     }
 
     // MARK: - 检测

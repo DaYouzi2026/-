@@ -93,6 +93,12 @@ final class CameraRecorder: NSObject, ObservableObject {
     /// 断流提示只记一次，免得日志被刷满
     private var audioWarned = false
     private var audioNextRetry: CFTimeInterval = 0
+    /// 整理音轨期间有人要求停会话：等整理完再停，别把正在读的文件链路拆了
+    private var stopPending = false
+    /// 已经收到「停止录制」，但成片还没交出去（写入收尾 + 整理音轨）
+    private var finishing = false
+    /// 停会话的兜底闹钟：整理链路万一卡住，也不能一直占着麦克风
+    private var stopFallback: DispatchWorkItem?
 
     @Published private(set) var ready = false
     /// 录完之后正在重建音轨。长视频要几秒，界面得给个动静
@@ -163,6 +169,44 @@ final class CameraRecorder: NSObject, ObservableObject {
     }
 
     func stop() {
+        // 状态都在主线程读写，后台来的调用先转回主线程
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { self.stop() }
+            return
+        }
+        // 正在收尾或整理音轨：先别关会话。这几个步骤都要读刚写完的文件和备份，
+        // 用户这时退出页面也不该把它拦腰截断 —— 记下来，等交付完再停。
+        if tidying || finishing {
+            stopPending = true
+            stopFallback?.cancel()
+            let w = DispatchWorkItem { [weak self] in
+                guard let self, self.stopPending else { return }
+                self.stopPending = false
+                self.doStop()
+            }
+            stopFallback = w
+            DispatchQueue.main.asyncAfter(deadline: .now() + 25, execute: w)
+            return
+        }
+        doStop()
+    }
+
+    /// 交付成片（成功或失败）统一走这里：清掉收尾状态，并执行被推迟的停会话。
+    private func deliver(_ url: URL?) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { self.deliver(url) }
+            return
+        }
+        finishing = false
+        stopFallback?.cancel()
+        stopFallback = nil
+        let stopNow = stopPending
+        stopPending = false
+        onFinish?(url)
+        if stopNow { doStop() }
+    }
+
+    private func doStop() {
         cfgQ.async {
             if self.session.isRunning {
                 self.session.stopRunning()
@@ -517,6 +561,13 @@ final class CameraRecorder: NSObject, ObservableObject {
     }
 
     private func beginRecordingNow(_ url: URL) {
+        // 上一次收尾可能因为异常没走到 deliver，这里把状态清干净，
+        // 否则新的一条一开录就会被「等整理完再停会话」卡住
+        finishing = false
+        stopPending = false
+        stopFallback?.cancel()
+        stopFallback = nil
+
         beginAudioBackup()
 
         // 开录后一秒半还是没有音频帧：基本就是麦克风这条路断了，先把话说在前面。
@@ -584,27 +635,40 @@ final class CameraRecorder: NSObject, ObservableObject {
     }
 
     func stopRecording() {
+        // 从这一刻到交付成片之间，会话先别关（关闭会让写文件/整理音轨的链路悬空）
+        if Thread.isMainThread {
+            finishing = true
+        } else {
+            DispatchQueue.main.async { self.finishing = true }
+        }
+
         if modeFlag == .native {
             cfgQ.async {
                 if self.movieOut.isRecording {
                     self.movieOut.stopRecording()
+                } else {
+                    // 没在录：撤销刚才那个标志，否则 stop() 会一直等下去
+                    DispatchQueue.main.async { self.finishing = false }
                 }
             }
             return
         }
 
         videoQ.async {
-            guard self.recordingFlag else { return }
+            guard self.recordingFlag else {
+                DispatchQueue.main.async { self.finishing = false }
+                return
+            }
             self.recordingFlag = false
             DispatchQueue.main.async { self.recording = false }
             self.writer.finish { url in
                 guard let u = url else {
                     self.endAudioBackup { _, _ in }
-                    self.onFinish?(nil)
+                    self.deliver(nil)
                     return
                 }
                 self.repairAudioIfNeeded(u) { fixed in
-                    self.onFinish?(fixed)
+                    self.deliver(fixed)
                 }
             }
         }
@@ -649,7 +713,7 @@ final class CameraRecorder: NSObject, ObservableObject {
                 DispatchQueue.main.async {
                     self.recording = false
                     self.recordingError = "编码器起不来，切回原相机模式再试"
-                    self.onFinish?(nil)
+                    self.deliver(nil)
                 }
                 return
             }
@@ -916,11 +980,14 @@ final class CameraRecorder: NSObject, ObservableObject {
                 return
             }
             DispatchQueue.global(qos: .userInitiated).async {
+                let t0 = CACurrentMediaTime()
                 let bs = SilenceCut.stats(b)
                 let asset = AVURLAsset(url: video)
                 let aTrack = asset.tracks(withMediaType: .audio).first
                 let vLen = asset.duration.seconds
-                let vs = aTrack == nil ? SilenceCut.AudioStats() : SilenceCut.stats(video)
+                // 成片音轨只抽查头尾：全程解码四分钟的 AAC 要好几秒，
+                // 而判断「整条哑了」看开头、「后半段断了」看尾巴就够了。
+                let vs = aTrack == nil ? SilenceCut.AudioStats() : SilenceCut.statsSampled(video)
 
                 // 成片音轨的四种坏法：没有、比视频短一截、整体静音、尾巴是死的。
                 // 阈值从 92% 收到 97%：四分钟的片子断在 3 分半，92% 是判不出来的。
@@ -938,7 +1005,8 @@ final class CameraRecorder: NSObject, ObservableObject {
                           + String(format: "%.1fs/%.0fdB/尾%.0fdB", bs.duration, bs.peak, bs.tail)
                           + " 成片音轨=\(vText) 视频="
                           + String(format: "%.1fs", vLen)
-                          + " 判定=\(broken ? "需补音" : "正常")")
+                          + " 判定=\(broken ? "需补音" : "正常") 体检 "
+                          + String(format: "%.2fs", CACurrentMediaTime() - t0))
 
                 DispatchQueue.main.async {
                     // 备份也是哑的：麦克风整条路没通，补也补不出声音，别白等一轮合成
@@ -947,13 +1015,23 @@ final class CameraRecorder: NSObject, ObservableObject {
                         done(video)
                         return
                     }
-                    // 成片看着没问题也照样用备份重建：直通合成只要一两秒，
-                    // 视频一个像素都不动。相机那条音轨太不可靠了 —— 诊断里
-                    // 「成片音轨=无」是常态，与其赌它这次写对了，不如统一用备份。
+                    // 成片音轨确实完好，就直接交片：重建要转 AAC + 整片直通拷贝，
+                    // 四分钟的片子得等好几秒，没必要为了「更保险」让每条都等。
+                    // 判据已经管住四种坏法（无音轨 / 变短 / 全哑 / 尾巴死）。
+                    guard broken else {
+                        Diag.note("成片音轨正常，跳过重建")
+                        done(video)
+                        return
+                    }
                     self.tidying = true
-                    self.mux(video: video, audio: b, offset: offset, mustFix: broken) { url in
+                    self.mux(video: video, audio: b, offset: offset, mustFix: true) { url in
                         self.tidying = false
                         done(url)
+                        // 整理期间有人退出了页面、要求关会话：现在可以关了
+                        if self.stopPending {
+                            self.stopPending = false
+                            self.doStop()
+                        }
                     }
                 }
             }
@@ -1275,12 +1353,12 @@ extension CameraRecorder: AVCaptureFileOutputRecordingDelegate {
             if !msg.isEmpty { self.recordingError = msg }
             guard finished else {
                 self.endAudioBackup { _, _ in }
-                self.onFinish?(nil)
+                self.deliver(nil)
                 return
             }
             // 万一这条路没把音轨写进文件，用录制期间备份的 PCM 补上，别让用户白录一条
             self.repairAudioIfNeeded(outputFileURL) { url in
-                self.onFinish?(url)
+                self.deliver(url)
             }
         }
     }

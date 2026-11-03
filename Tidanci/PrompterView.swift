@@ -527,12 +527,17 @@ struct PrompterView: View {
             if cam.tidying {
                 VStack {
                     Spacer()
-                    HStack(spacing: 8) {
-                        ProgressView()
-                            .scaleEffect(0.75)
-                        Text("正在整理音轨…")
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundColor(.white)
+                    VStack(spacing: 2) {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .scaleEffect(0.75)
+                            Text("正在整理音轨…")
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundColor(.white)
+                        }
+                        Text("可以退出，好了会自动保存")
+                            .font(.system(size: 11))
+                            .foregroundColor(.white.opacity(0.72))
                     }
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
@@ -881,6 +886,11 @@ struct PrompterView: View {
     private func tapRecord() {
         if cam.recording {
             cam.stopRecording()
+            return
+        }
+        // 上一条还在重建音轨就开新录，会把备份文件和会话搅在一起
+        if cam.tidying {
+            showTip("上一条还在整理音轨，稍等一下")
             return
         }
         guard cam.ready else {
