@@ -8,7 +8,8 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    # macos-14 于 2026-11-02 退役，标签失效会让任务一创建就被取消
+    runs-on: macos-15
     timeout-minutes: 35
 
     steps:
