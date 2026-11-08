@@ -231,9 +231,18 @@ final class SpeechFollower: ObservableObject {
     /// v1.13：重开请求时识别器偶尔会先把上一句的尾巴再吐一遍，拼起来就是
     /// 「今天我们来聊」+「聊今天我们来聊」这种重复片段。对齐那边看到两遍同样的字，
     /// 会以为人已经念到下一处相同的话了，位置就飘了。这里把重复的头砍掉。
+    /// v6：这里原来还会把 `carry`（上一句的最后十个字）**拼到新句子前面**，当「探针拐杖」。
+    ///
+    /// 那是个坏主意，原因在 Align 那边：它只取累积文本的**最后 14 个字**做模糊匹配。
+    /// 新句刚开口两三个字时，这 14 个字里十来个是上一句的尾巴 —— 而上一句的尾巴在
+    /// 当前位置是完美匹配的，于是「读完了它不动」；更糟的是「上句尾巴＋新句开头」这种
+    /// 混合串在台本别处找到更便宜的匹配，光标就整段跳过去。这就是「到处跑」。
+    ///
+    /// 现在只做一件事：把重开请求时识别器重复吐出来的上一句尾巴砍掉。
+    /// 新句开头探针短，推进慢一点（一次两三个字），但位置不会错。
     private func composed(_ text: String) -> String {
-        if carry.isEmpty { return text }
         var kept = String(text.filter { PreparedScript.keep($0) })
+        if carry.isEmpty { return kept }
 
         let c = Array(carry)
         var overlap = 0
@@ -246,10 +255,7 @@ final class SpeechFollower: ObservableObject {
             len -= 1
         }
         if overlap > 0 { kept = String(kept.dropFirst(overlap)) }
-
-        if kept.count >= 6 { return kept }
-        if kept.isEmpty { return carry }
-        return carry + kept
+        return kept
     }
 
     private func handle(_ e: NSError, rec: SFSpeechRecognizer) {

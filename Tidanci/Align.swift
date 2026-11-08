@@ -209,6 +209,13 @@ final class Follower {
     /// 这一跳落在哪儿。五秒后如果只从落点往前挪了不到十五个字，就判定跳错了。
     private var jumpTo = 0
     private var jumpBackDeadline = Date.distantPast
+    /// 被判成「跳错了」的落点。
+    ///
+    /// v6：没有这个记录，回退之后会立刻又选中同一个错地方（证据一模一样），
+    /// 于是「跳过去 → 五秒后退回来 → 再跳过去」，用户看到的就是画面来回抽。
+    /// 现在这一段二十秒内不再作为候选。
+    private var badLanding: Int? = nil
+    private var badAt = Date.distantPast
 
     /// 插入 / 漏一个字的代价
     private let GAP = 45
@@ -402,6 +409,8 @@ final class Follower {
         if let back = jumpBack, Date() > jumpBackDeadline, cursor - jumpTo < 15 {
             jumpBack = nil
             bigJumpAt = Date.distantPast        // 回退之后允许它重新找，别被自己的抑制卡死
+            badLanding = jumpTo                 // 但这个落点二十秒内不许再来
+            badAt = Date()
             cursor = back
             stall = 0
             grow = 0
@@ -497,6 +506,9 @@ final class Follower {
         var bestRaw: Float = 1
         /// 两秒半内已经大步前进过一次（见 commit），这一轮再大步前进就不认
         let recentBig = Date().timeIntervalSince(bigJumpAt) < 2.5
+        /// 上次跳错的落点，二十秒内不再选它（否则回退后会立刻原样再跳一次）
+        var bad = -100000
+        if let b = badLanding, Date().timeIntervalSince(badAt) < 20 { bad = b }
 
         var i = lo + 1
         while i <= hi {
@@ -539,7 +551,10 @@ final class Follower {
             // 两秒半内刚大步前进过一次，这一轮不许再大步前进（往回退不算）。
             // 「顺着重复的字一路往下滑」的典型形态就是连着一跳接一跳。
             let blocked = recentBig && jump > 40
-            if !blocked && pass(jump, raw, run[k], eff, good[k]) {
+            // 只拦「远跳」：真读到那一段时是一字一字挪过去的（jump 很小），
+            // 不能因为那儿曾经跳过错就把它整段封死。
+            let poisoned = abs(i - bad) <= 15 && jump > 25
+            if !blocked && !poisoned && pass(jump, raw, run[k], eff, good[k]) {
                 var rank = raw + distPenalty(jump)
                 if nearSentenceStart(i, 1) { rank -= 0.015 }
                 if rank < bestRank {
@@ -576,6 +591,7 @@ final class Follower {
         grow = 0
         jumpBack = nil
         bigJumpAt = Date.distantPast
+        badLanding = nil
         lastMatchAt = Date()
         lastSpokenLen = 0
         lastScore = 1

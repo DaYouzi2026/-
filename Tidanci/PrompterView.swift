@@ -59,7 +59,8 @@ struct ScriptTextView: UIViewRepresentable {
     final class Coordinator: NSObject {
         var parent: ScriptTextView
         var lastHeight: CGFloat = 0
-        private var lastKey = ""
+        private var lastTextKey = ""
+        private var lastReadEnd = -1
 
         init(_ p: ScriptTextView) {
             parent = p
@@ -92,31 +93,49 @@ struct ScriptTextView: UIViewRepresentable {
             DispatchQueue.main.async { cb(tv) }
         }
 
+        /// 排版只在「文本 / 字号 / 行距」变了时重建；已读高亮单独走 textStorage。
+        ///
+        /// v6：原来把 readEnd 也放进了 key，于是每认出一个字就 `tv.attributedText = s`
+        /// 整篇重设一次。给 attributedText 赋值会重置 contentOffset、并取消正在跑的
+        /// 滚动动画 —— 高亮（改颜色）立刻生效，滚动被反复打断停在原地。
+        /// 这就是「框已经跳到下一行、页面却不翻」的机器原因。
         func apply(_ tv: UITextView) {
-            let key = "\(parent.prepared.text.count)|\(parent.readEnd)|\(Int(parent.fontSize))|\(Int(parent.lineGap * 100))"
-            guard key != lastKey else { return }
-            lastKey = key
+            let textKey = "\(parent.prepared.text.count)|\(Int(parent.fontSize))|\(Int(parent.lineGap * 100))"
+            if textKey != lastTextKey {
+                lastTextKey = textKey
+                lastReadEnd = -1        // 重新载入后整篇颜色要重刷一遍
 
-            let ps = NSMutableParagraphStyle()
-            ps.lineSpacing = parent.fontSize * parent.lineGap
-            ps.lineBreakMode = .byWordWrapping
+                let ps = NSMutableParagraphStyle()
+                ps.lineSpacing = parent.fontSize * parent.lineGap
+                ps.lineBreakMode = .byWordWrapping
 
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: UIFont.systemFont(ofSize: parent.fontSize, weight: .semibold),
-                .foregroundColor: UIColor.white,
-                .paragraphStyle: ps
-            ]
-            let s = NSMutableAttributedString(string: parent.prepared.text, attributes: attrs)
-            let total = parent.prepared.text.utf16.count
-            let end = max(0, min(parent.readEnd, total))
-            if end > 0 {
-                s.addAttribute(.foregroundColor,
-                               value: UIColor.white.withAlphaComponent(0.28),
-                               range: NSRange(location: 0, length: end))
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: UIFont.systemFont(ofSize: parent.fontSize, weight: .semibold),
+                    .foregroundColor: UIColor.white,
+                    .paragraphStyle: ps
+                ]
+                let s = NSMutableAttributedString(string: parent.prepared.text, attributes: attrs)
+                let off = tv.contentOffset
+                tv.attributedText = s
+                tv.contentOffset = off
             }
-            let off = tv.contentOffset
-            tv.attributedText = s
-            tv.contentOffset = off
+
+            let total = (tv.text as NSString).length
+            let end = max(0, min(parent.readEnd, total))
+            guard end != lastReadEnd else { return }
+            lastReadEnd = end
+
+            // 只改颜色：不碰布局、不碰 contentOffset，滚动动画就不会被打断
+            tv.textStorage.beginEditing()
+            tv.textStorage.addAttribute(.foregroundColor,
+                                        value: UIColor.white,
+                                        range: NSRange(location: 0, length: total))
+            if end > 0 {
+                tv.textStorage.addAttribute(.foregroundColor,
+                                            value: UIColor.white.withAlphaComponent(0.28),
+                                            range: NSRange(location: 0, length: end))
+            }
+            tv.textStorage.endEditing()
         }
     }
 }
@@ -229,7 +248,8 @@ struct PrompterView: View {
         .onAppear(perform: boot)
         .onDisappear(perform: bye)
         .onChange(of: engine.cursor) { c in
-            scrollTo(c)
+            // 不再在这里滚动：跟读的滚动由 30Hz 的 followTick 连续驱动。
+            // 以前是「游标一变就发一次动画」，动画被改字/重排打断一次就永久停住。
             // 一次跳了几十个字：多半是被重复的话带偏了。这时候告诉用户「能自己指」，
             // 比让他顶着错位继续念、或者退出去重录强。
             if !locateHintShown && abs(c - lastCursorForHint) > 60 {
@@ -795,6 +815,11 @@ struct PrompterView: View {
                 if y > maxY { y = maxY }
                 tv.contentOffset = CGPoint(x: 0, y: y)
             }
+            // 跟读：滚动由帧驱动，不再靠「游标一变发一次动画」——
+            // 那条路只要动画被打断一次（改字、拖框、系统重排），页面就永久停在原地。
+            if followOn, !autoScroll, let tv = textView {
+                followTick(tv)
+            }
             if cam.recording {
                 recSec = Int(Date().timeIntervalSince(recStart))
             }
@@ -847,27 +872,56 @@ struct PrompterView: View {
 
     // MARK: - 滚动
 
-    private func scrollTo(_ c: Int) {
-        guard let tv = textView, !autoScroll else { return }
+    /// 光标所在行应该落到框里的哪个 contentOffset。滚动、跳转、改框大小都从这里取目标。
+    ///
+    /// v6 这里是「框跳了、页面不翻」的真凶：原来用
+    /// `boundingRect(forGlyphRange: 长度为 0 的范围)` 量位置，零长度范围的返回值不可靠
+    /// （常见是零矩形 / 空矩形）。返回 y=0 时目标算成 `-contentInset.top`，正好等于起点，
+    /// 于是 offset 永远被钉在开头 —— 高亮是另一条线，照常往下走，看起来就是「框到下一行、
+    /// 页面不翻」。现在直接取所在行的 `lineFragmentRect`，跟长度无关，不会退化成 0。
+    private func targetOffset(for c: Int, in tv: UITextView) -> CGFloat {
         let p = engine.prepared
         let n = p.offsets.count
-        guard n > 0 else { return }
+        let minY = -tv.contentInset.top
+        guard n > 0 else { return minY }
+
         let off = c >= n ? p.text.utf16.count : p.offsets[max(0, c)]
         let len = (tv.text as NSString).length
-        let loc = min(off, len)
+        guard len > 0 else { return minY }
+        let loc = min(max(0, off), len - 1)      // 行位置按「最后一个字」取
+
         let lm = tv.layoutManager
-        let gr = lm.glyphRange(forCharacterRange: NSRange(location: loc, length: 0),
-                               actualCharacterRange: nil)
-        let rect = lm.boundingRect(forGlyphRange: gr, in: tv.textContainer)
+        // 不先排版，还没排到的段落会量出零高度 —— 目标就算成「回到顶部」
+        lm.ensureLayout(for: tv.textContainer)
+        let gi = lm.glyphIndexForCharacter(at: loc)
+        let frag = lm.lineFragmentRect(forGlyphAt: gi, effectiveRange: nil)
         let focusY = tv.bounds.height * ScriptTextView.focus
-        let tar = rect.origin.y + tv.textContainerInset.top - focusY
-        let maxY = max(0, tv.contentSize.height + tv.contentInset.bottom - tv.bounds.height)
-        let y = min(max(tar, -tv.contentInset.top), maxY)
-        UIView.animate(withDuration: 0.32,
-                       delay: 0,
-                       options: [.curveEaseOut, .allowUserInteraction, .beginFromCurrentState]) {
-            tv.contentOffset = CGPoint(x: 0, y: y)
-        }
+        let tar = frag.origin.y + tv.textContainerInset.top - focusY
+
+        let used = lm.usedRect(for: tv.textContainer).height
+        let contentH = used + tv.textContainerInset.top + tv.textContainerInset.bottom
+        let maxY = max(minY, contentH + tv.contentInset.bottom - tv.bounds.height)
+        return min(max(tar, minY), maxY)
+    }
+
+    /// 一拍跟随：每帧朝目标缓动。
+    /// 跟读的滚动原来是「游标一变就发一次动画」，动画被打断就永远停在原地；
+    /// 现在改成由帧驱动，任何一次被外部重置的 offset，下一帧都会被拉回来。
+    private func followTick(_ tv: UITextView) {
+        // 手指正按着拖字，不抢
+        guard !tv.isTracking, !tv.isDragging, !tv.isDecelerating else { return }
+        let y = targetOffset(for: engine.cursor, in: tv)
+        let dy = y - tv.contentOffset.y
+        if abs(dy) < 0.5 { return }
+        tv.contentOffset = CGPoint(x: 0, y: tv.contentOffset.y + dy * 0.30)
+    }
+
+    /// 立刻把画面挪到某一行。只给「离散跳转」用（双击定位、拖动提词框）；
+    /// 跟读过程中不要调它，滚动一律交给 followTick —— 两套东西同时写 contentOffset
+    /// 会互相打断，正是原来「框跳了、页面停住」的现场。
+    private func scrollTo(_ c: Int) {
+        guard let tv = textView, !autoScroll else { return }
+        tv.contentOffset = CGPoint(x: 0, y: targetOffset(for: c, in: tv))
     }
 
     private func restart() {
