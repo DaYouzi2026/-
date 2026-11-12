@@ -862,6 +862,11 @@ import ImageIO
             primeBackup(rate: fmt.sampleRate, channels: ch, pad: sec)
         }
         appendAudioBackup(pcm, pts: CMTime(seconds: max(0, sec), preferredTimescale: 600_000))
+
+        // 这一帧同时喂给语音识别（提词跟读）。
+        // 以前 onAudio 是靠相机会话的音频输出回调触发的；麦克风搬到独立引擎后，
+        // 相机那条路不再有音频帧，这里不补一句，跟读就等于聋了。
+        onAudio?(pcm)
     }
 
     /// 给备份文件定格式，并把开头那段「引擎还没启动完」的空档补成静音。
