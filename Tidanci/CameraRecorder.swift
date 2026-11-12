@@ -13,7 +13,17 @@ import ImageIO
 ///   预览走 AVSampleBufferDisplayLayer。这条路走 GPU，1080P 封顶。
 ///
 /// 两条路共用一路音频：既喂语音识别，也喂录制。
-final class CameraRecorder: NSObject, ObservableObject {
+///
+/// ── v1.20：音频从相机会话里搬出来 ──────────────────────────
+/// 以前音频挂在 AVCaptureSession 上（AVCaptureAudioDataOutput），和视频共用一条命。
+/// 录长片时机身发热、相机管线降频，或者来个电话、蓝牙耳机掉线，音频连接会先被牺牲；
+/// 画面还在写，声音这条路死了 —— 而 `AVAudioSession` 怎么重设类别都救不回来，
+/// 因为 session 的 audio connection 不会自己重建。这就是「录久一点就没声」的真身。
+///
+/// 现在麦克风走 MicTap（AVAudioEngine 的 inputNode），完全绕开相机管线：
+/// 相机崩了、降频了、被中断了，录音照走。成片一律靠备份 WAV 合成音轨，
+/// 走的是已有的 passthrough 补音链路，视频不重编码。
+/// final class CameraRecorder: NSObject, ObservableObject {
 
     enum Mode: String {
         case native
@@ -30,6 +40,10 @@ final class CameraRecorder: NSObject, ObservableObject {
     private let videoOut = AVCaptureVideoDataOutput()
     private let audioOut = AVCaptureAudioDataOutput()
     private let writer = BeautyWriter()
+
+    /// 麦克风走独立引擎（AVAudioEngine），不挂在相机会话上。
+    /// 相机管线被热限流、被来电打断、被别的 App 抢走时，录音这条路还在。
+    private let mic = MicTap()
 
     private var videoIn: AVCaptureDeviceInput?
     private var audioIn: AVCaptureDeviceInput?
@@ -84,6 +98,11 @@ final class CameraRecorder: NSObject, ObservableObject {
 
     /// 录制中盯着麦克风：太久没收到音频就把音频环境重新激活一次
     private var audioWatch: DispatchSourceTimer?
+
+    /// 开录时刻的 hostTime。音频时间轴以它为 0 点，和视频 PTS 对齐。
+    private var audioStartHost: UInt64 = 0
+    /// 独立引擎起不来（被别的 App 长期占着麦之类），退回相机自带的那条音频路
+    private var micFailed = false
 
     /// 最近一帧麦克风音频的时间（不论有没有在录）。开录前用它判断「麦克风到底有没有出数据」，
     /// 没数据就先修，而不是稀里糊涂录一条无声视频。
@@ -142,22 +161,9 @@ final class CameraRecorder: NSObject, ObservableObject {
             if self.session.inputs.isEmpty {
                 self.configure(front: front)
             }
-            // 首次授权那一瞬间麦克风常常还没就绪。在会话「跑起来之前」再补一次，
-            // 这时候加输入不会打断任何东西；跑起来之后再动会话才是危险的。
-            //
-            // 一次不成不代表没有：刚授权那几百毫秒里音频设备还在初始化，
-            // AVCaptureDeviceInput 会抛错。老代码只试一次，失败就整场哑掉 ——
-            // 这就是「第一次录的视频没有声音」。这里给 4 次机会、每次隔 120ms，
-            // 最多多等 0.36 秒（只在异常情况才等）。
-            if self.audioIn == nil, AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
-                for attempt in 0..<4 {
-                    self.session.beginConfiguration()
-                    let ok = self.addAudioInput()
-                    self.session.commitConfiguration()
-                    if ok { break }
-                    if attempt < 3 { Thread.sleep(forTimeInterval: 0.12) }
-                }
-            }
+            // 以前这里会趁会话没跑起来先补一路麦克风输入。
+            // 现在音频走独立引擎（MicTap），相机会话里再挂麦克风反而会和它抢，
+            // 所以这里一个字都不加 —— 真起不来时由 fallbackToSessionAudio() 兜。
             if !self.session.isRunning {
                 self.session.startRunning()
             }
@@ -207,6 +213,9 @@ final class CameraRecorder: NSObject, ObservableObject {
     }
 
     private func doStop() {
+        // 异常路径下 endAudioBackup 可能没跑到，这里兜一次，别让引擎一直占着麦
+        mic.onBuffer = nil
+        mic.stop()
         cfgQ.async {
             if self.session.isRunning {
                 self.session.stopRunning()
@@ -360,7 +369,9 @@ final class CameraRecorder: NSObject, ObservableObject {
             return
         }
 
-        addAudioInput()
+        // 音频不挂在相机会话上：MicTap 用 AVAudioEngine 单独采。
+        // 以前 addAudioInput() 挂在这里，等于让音频和视频共用一条命，
+        // 长录时机身一热、相机管线一降频，音频连接先断，补都补不回来。
 
         applyFormat(dev)
         configureOutputs()
@@ -382,25 +393,6 @@ final class CameraRecorder: NSObject, ObservableObject {
             return true
         } catch {
             return false
-        }
-    }
-
-    /// 录制前补齐音频输入。首次启动相机、刚授权、或者被别的 App 打断过之后都可能缺一路，
-    /// 缺了就一定录出无声视频，所以每次开录前都确认一遍。
-    private func ensureAudioInput(then done: @escaping (Bool) -> Void) {
-        cfgQ.async {
-            if self.audioIn != nil, self.session.inputs.contains(where: { $0 === self.audioIn }) {
-                DispatchQueue.main.async { done(true) }
-                return
-            }
-            self.session.beginConfiguration()
-            let ok = self.addAudioInput()
-            if ok {
-                // 输入变了，输出连接会重建，镜像要重新设一遍
-                self.applyMirror()
-            }
-            self.session.commitConfiguration()
-            DispatchQueue.main.async { done(ok) }
         }
     }
 
@@ -545,17 +537,18 @@ final class CameraRecorder: NSObject, ObservableObject {
     func startRecording(to url: URL) {
         audioFrameCount = 0
 
-        // 开录前先问一句「麦克风现在到底出不出数据」。
-        // 没数据就先把音频路由抢回来，等它缓过来再开录——
-        // 比让人对着镜头说完一整段、回放才发现没声音强得多。
-        let age = CACurrentMediaTime() - lastAudioFrameAt
-        if age > 1.0 {
-            Diag.note("开录前 \(String(format: "%.1f", age)) 秒没音频帧，先修路由")
-            AudioSession.enforceForCamera()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
-                self?.beginRecordingNow(url)
+        // 独立引擎是「开录才启动」的，之前当然没有音频帧，不用在这儿等。
+        // 只有退回相机自带音频的那条路，才需要在开录前先摸一下路由通不通。
+        if micFailed {
+            let age = CACurrentMediaTime() - lastAudioFrameAt
+            if age > 1.0 {
+                Diag.note("开录前 \(String(format: "%.1f", age)) 秒没音频帧，先修路由")
+                AudioSession.enforceForCamera()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+                    self?.beginRecordingNow(url)
+                }
+                return
             }
-            return
         }
         beginRecordingNow(url)
     }
@@ -568,6 +561,10 @@ final class CameraRecorder: NSObject, ObservableObject {
         stopFallback?.cancel()
         stopFallback = nil
 
+        // 音频会话先摆到位，再启动麦克风引擎：录制中途一次 setCategory
+        // 就能把 AVAudioEngine 踹停，顺序反了等于白开
+        AudioSession.keepAlive()
+        audioStartHost = mach_absolute_time()
         beginAudioBackup()
 
         // 开录后一秒半还是没有音频帧：基本就是麦克风这条路断了，先把话说在前面。
@@ -580,15 +577,9 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
 
         if modeFlag == .native {
-            // 正常情况下一个字都不改，直接开录（1.9 就是这么跑的，稳）。
-            // 只有在「一个麦克风输入都没有」这种异常状态，才补一次输入再开录。
-            if audioIn == nil, AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
-                ensureAudioInput { ok in
-                    self.beginNativeRecording(url: url, micOK: ok)
-                }
-            } else {
-                beginNativeRecording(url: url, micOK: audioIn != nil)
-            }
+            // 声音由独立引擎负责，相机只管画面。micOK 表示引擎起没起来；
+            // 起不来说明这一条要走回退路径（相机自带音频），下面 beginAudioBackup 已经判过了。
+            beginNativeRecording(url: url, micOK: !micFailed)
             return
         }
 
@@ -778,6 +769,9 @@ final class CameraRecorder: NSObject, ObservableObject {
                 try? self.backupHandle?.seekToEnd()
             }
 
+            // 麦克风这条路单独启动，和相机没有关系
+            self.startMic()
+
             // 录制中盯着麦克风。阈值收到 0.7 秒：识别一句话说完会重开请求，
             // 那一下最容易把音频会话带偏，早一点抢回来还有救，晚两秒就整段哑了。
             self.audioWarned = false
@@ -785,23 +779,117 @@ final class CameraRecorder: NSObject, ObservableObject {
             let t = DispatchSource.makeTimerSource(queue: self.audioQ)
             t.schedule(deadline: .now() + 0.6, repeating: 0.4)
             t.setEventHandler { [weak self] in
-                guard let self, self.backupOn, self.lastAudioAt > 0 else { return }
+                guard let self, self.backupOn else { return }
+
+                // 硬件配置变了（插拔耳机、系统重配）：引擎这时候已经停了，
+                // 但不报错、只是不再出数据。要立刻重开，不能等断流判断。
+                if !self.micFailed, self.mic.needsRestart {
+                    let ok = self.mic.restart()
+                    Diag.note("音频硬件配置变了，重开引擎\(ok ? "成功" : "失败")")
+                    if !ok {
+                        self.micFailed = true
+                        self.fallbackToSessionAudio()
+                    }
+                    return
+                }
+
+                // 一帧都没来过时按「从开录算到现在」算，否则永远进不了恢复逻辑
                 let now = CACurrentMediaTime()
-                let gap = now - self.lastAudioAt
+                let gap = self.lastAudioAt > 0 ? now - self.lastAudioAt : now - self.recordStartAt
                 // 最多每 1.5 秒抢一次：反复 setCategory 本身就会打断采集，
                 // 抢得太勤反而把刚恢复的 I/O 又踹一脚。
                 guard gap > 0.7, now >= self.audioNextRetry else { return }
                 self.audioNextRetry = now + 1.5
-                let changed = AudioSession.enforceForCamera()
-                if !self.audioWarned {
-                    self.audioWarned = true
-                    Diag.note(String(format: "录音断流 %.1fs，已强制恢复音频路由%@",
-                                     gap, changed ? "（换了类别）" : ""))
+
+                if self.micFailed {
+                    let changed = AudioSession.enforceForCamera()
+                    if !self.audioWarned {
+                        self.audioWarned = true
+                        Diag.note(String(format: "录音断流 %.1fs，已强制恢复音频路由%@",
+                                         gap, changed ? "（换了类别）" : ""))
+                    }
+                    return
+                }
+
+                // 独立引擎不出数据了：它跟相机无关，重开一次基本就能回来。
+                // 时间基准固定不动，重开前后接在同一条时间轴上。
+                let ok = self.mic.restart()
+                Diag.note(String(format: "录音断流 %.1fs，重开独立引擎%@", gap, ok ? "成功" : "失败"))
+                if !ok {
+                    self.micFailed = true
+                    self.fallbackToSessionAudio()
                 }
             }
             self.audioWatch?.cancel()
             self.audioWatch = t
             t.resume()
+        }
+    }
+
+    // MARK: - 独立麦克风
+
+    /// 启动独立麦克风引擎，把每一帧接到备份文件上。
+    private func startMic() {
+        mic.onBuffer = { [weak self] pcm, sec in
+            guard let self else { return }
+            self.audioQ.async {
+                self.lastAudioFrameAt = CACurrentMediaTime()
+                self.audioFrameCount += 1
+                self.handleMicBuffer(pcm, at: sec)
+            }
+        }
+
+        if mic.start(videoStartHost: audioStartHost) {
+            micFailed = false
+            Diag.note("麦克风：独立引擎已启动 \(Int(mic.sampleRate))Hz/\(mic.channels)ch")
+        } else {
+            micFailed = true
+            Diag.note("麦克风：独立引擎起不来（\(mic.lastError)），退回相机音频")
+            fallbackToSessionAudio()
+        }
+    }
+
+    /// 独立引擎来的一帧：按它自己的时间戳落位写进备份。
+    private func handleMicBuffer(_ pcm: AVAudioPCMBuffer, at sec: Double) {
+        guard backupOn else { return }
+        let fmt = pcm.format
+        let ch = Int(fmt.channelCount)
+        guard ch > 0, fmt.sampleRate > 8000 else { return }
+
+        if firstAudioPts < 0 {
+            // 第一帧才知道「比视频晚多少」（引擎启动本身要几十毫秒）。
+            // 把这段空档补成静音，备份的时间轴就从视频的 0 秒开始算。
+            primeBackup(rate: fmt.sampleRate, channels: ch, pad: sec)
+        }
+        appendAudioBackup(pcm, pts: CMTime(seconds: max(0, sec), preferredTimescale: 600_000))
+    }
+
+    /// 给备份文件定格式，并把开头那段「引擎还没启动完」的空档补成静音。
+    private func primeBackup(rate: Double, channels: Int, pad: Double) {
+        guard backupOn, let h = backupHandle, firstAudioPts < 0 else { return }
+        guard rate > 8000, channels > 0 else { return }
+
+        backupRate = rate
+        backupChannels = channels
+        firstAudioPts = 0
+        offsetFixed = true
+        backupOffset = 0
+
+        let frames = Int((min(max(pad, 0), 1.0) * rate).rounded())
+        if frames > 0 {
+            writeZeros(frames, channels: channels, handle: h)
+        }
+    }
+
+    /// 独立引擎彻底起不来时的退路：把音频接回相机会话（老路径）。
+    private func fallbackToSessionAudio() {
+        cfgQ.async {
+            guard self.audioIn == nil else { return }
+            self.session.beginConfiguration()
+            let ok = self.addAudioInput()
+            self.session.commitConfiguration()
+            Diag.note("回退：音频挂回相机会话\(ok ? "成功" : "失败")")
+            if ok { AudioSession.enforceForCamera() }
         }
     }
 
@@ -842,6 +930,10 @@ final class CameraRecorder: NSObject, ObservableObject {
     /// 录制结束：关掉备份并交出文件地址。必须等文件写完再读，
     /// 否则读到的是半个文件，补进去的音频会截断。
     private func endAudioBackup(_ done: @escaping (URL?, Double) -> Void) {
+        // 先停独立麦克风，保证不再往队列里塞新帧；
+        // 已经排队的帧会在下面这段之前写完。
+        mic.onBuffer = nil
+        mic.stop()
         audioQ.async {
             self.backupOn = false
             self.audioWatch?.cancel()
@@ -975,7 +1067,12 @@ final class CameraRecorder: NSObject, ObservableObject {
     private func repairAudioIfNeeded(_ video: URL, done: @escaping (URL?) -> Void) {
         endAudioBackup { backup, offset in
             guard let b = backup else {
-                Diag.note("没有可用备份，成片原样输出")
+                let av = AVURLAsset(url: video)
+                let hasAudio = !av.tracks(withMediaType: .audio).isEmpty
+                Diag.note("没有可用备份，成片音轨=\(hasAudio ? "有" : "无")")
+                if !hasAudio {
+                    DispatchQueue.main.async { self.recordingError = "这条没录到声音，建议重录" }
+                }
                 done(video)
                 return
             }
