@@ -8,8 +8,10 @@ on:
 
 jobs:
   build:
-    # macos-14 于 2026-11-02 退役，标签失效会让任务一创建就被取消
-    runs-on: macos-15
+    # 别写死具体版本标签：macos-15 这个标签现在调不到机器，
+    # 任务会一直排队、15 分钟后被系统取消（日志一片空白）。
+    # macos-latest 实测 30 秒就能拿到机器。
+    runs-on: macos-latest
     timeout-minutes: 35
 
     steps:
