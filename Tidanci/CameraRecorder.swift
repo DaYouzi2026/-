@@ -23,7 +23,7 @@ import ImageIO
 /// 现在麦克风走 MicTap（AVAudioEngine 的 inputNode），完全绕开相机管线：
 /// 相机崩了、降频了、被中断了，录音照走。成片一律靠备份 WAV 合成音轨，
 /// 走的是已有的 passthrough 补音链路，视频不重编码。
-/// final class CameraRecorder: NSObject, ObservableObject {
+final class CameraRecorder: NSObject, ObservableObject {
 
     enum Mode: String {
         case native
