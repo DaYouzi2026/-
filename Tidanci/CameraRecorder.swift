@@ -75,6 +75,9 @@ final class CameraRecorder: NSObject, ObservableObject {
 
     // 只在 videoQ 上读写
     private var recordingFlag = false
+    /// 当前是原相机模式（videoQ 上的副本）。原相机预览走 PreviewLayer，
+    /// 帧不需要过 Core Image，识别靠 modeFlag 不可靠（跨队列），所以留一份在这里。
+    private var nativeModeV = false
     /// native 录制中：videoQ 上的副本，避免跨队列读 modeFlag
     private var nativeRecV = false
     private var pendingURL: URL?
@@ -674,6 +677,10 @@ final class CameraRecorder: NSObject, ObservableObject {
         // 输出刚加完，连接才存在，镜像和防抖都要在这时候设
         applyMirror()
         applyStabilization()
+
+        // 视频回调在 videoQ 上跑，模式也给它一份副本：原相机不做图像处理，直接送写入器
+        let isNative = (modeFlag == .native)
+        videoQ.async { self.nativeModeV = isNative }
     }
 
     private func applyFormat(_ dev: AVCaptureDevice) {
@@ -1043,9 +1050,10 @@ final class CameraRecorder: NSObject, ObservableObject {
 
     private func handleVideo(_ sb: CMSampleBuffer) {
         // v1.27：native 不做任何图像处理，原样交给写入器（硬件编码，零拷贝）。
-        // 预览走 AVCaptureVideoPreviewLayer，不经过这里，所以这条路上没有多余开销。
-        if nativeRecV {
-            movie.appendVideo(sb)
+        // 预览走 AVCaptureVideoPreviewLayer，不经过这里 —— 所以这条路上没有多余开销，
+        // 4K 也不会因为跑美颜管线掉帧。
+        if nativeModeV {
+            if nativeRecV { movie.appendVideo(sb) }
             return
         }
 
