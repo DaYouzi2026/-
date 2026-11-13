@@ -469,11 +469,18 @@ struct PrompterView: View {
             HStack(spacing: 8) {
                 pill(cam.presetText, mono: true)
 
-                // 防抖真的生效时才显示（关掉不占地方）；4K60 上电影级会被降档，
-                // 用户在这里就能看到「实际给了什么」，不用去设置页猜。
-                if !cam.stabilText.isEmpty {
-                    pill(cam.stabilText)
-                }
+                // 防抖胶囊常显（含「防抖·关」），点一下在 关→标准→电影级 之间循环。
+                // 4K60 上电影级会被降档，胶囊显示的是实际生效的档位。
+                pill(cam.stabilText)
+                    .onTapGesture {
+                        guard !cam.recording else {
+                            showTip("录制中不能换防抖，停了再换")
+                            return
+                        }
+                        Haptics.tap()
+                        stabilization = (stabilization + 1) % 3
+                    }
+                    .accessibilityLabel(cam.stabilText + "，点按切换防抖档位")
 
                 if cam.recording {
                     HStack(spacing: 5) {

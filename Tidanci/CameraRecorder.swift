@@ -239,6 +239,15 @@ final class CameraRecorder: NSObject, ObservableObject {
         mic.onBuffer = nil
         mic.stop()
         stopNativeWatch()
+        // 兜底：界面以为没在录（开录确认晚了 / 状态被误判清掉），但 movieOut 还在写。
+        // 直接 stopRunning 会把 mp4 腰斩、音轨整条丢 —— 必须先走正常停录，
+        // didFinishRecordingTo 处理完音轨校验后，deliver 看到 stopPending 会再来一趟 doStop 关会话。
+        if movieOut.isRecording {
+            finishing = true
+            stopPending = true
+            cfgQ.async { self.movieOut.stopRecording() }
+            return
+        }
         cfgQ.async {
             if self.session.isRunning {
                 self.session.stopRunning()
@@ -325,8 +334,9 @@ final class CameraRecorder: NSObject, ObservableObject {
 
         let level = Self.level(of: actual)
         DispatchQueue.main.async {
-            // 关掉就不占地方；开着才在拍摄页挂一个「防抖·标准」的小胶囊
-            self.stabilText = level == .off ? "" : "防抖·\(level.title)"
+            // 拍摄页那个小胶囊常显（含「防抖·关」），点一下换档 —— 防抖本来就是
+            // 可选项，得让用户在拍摄页一眼看到现在是开还是关，不用去设置页翻。
+            self.stabilText = "防抖·\(level.title)"
         }
         if level != want {
             Diag.note("防抖：想要\(want.title)，这个画质只给到\(level.title)")
@@ -617,7 +627,10 @@ final class CameraRecorder: NSObject, ObservableObject {
         if modeFlag == .native {
             if session.canAddOutput(movieOut) {
                 session.addOutput(movieOut)
-                movieOut.movieFragmentInterval = CMTime(seconds: 10, preferredTimescale: 600)
+                // ⚠️ 绝不能设 movieFragmentInterval：设了之后录制超过 10 秒
+                // 音轨整条丢失（多条实测 + Stack Overflow/CSDN 同类案例），
+                // 正是 v1.23「39.0s / 22.9s 成片音轨=无」的元凶。系统相机的
+                // 分片写盘是私有实现，我们抄不来，这里保持默认（.invalid）。
             }
             if let c = movieOut.connection(with: .video), c.isVideoOrientationSupported {
                 c.videoOrientation = .portrait
@@ -875,33 +888,26 @@ final class CameraRecorder: NSObject, ObservableObject {
             }
 
             try? FileManager.default.removeItem(at: url)
-            // 先真开录，再把「正在录」这套状态发到界面。
-            // 以前是在 startRecording 之前 main.async 置状态，那个异步块可能晚于开录执行，
-            // 会把开录后看门狗刚写进去的提示又冲掉（或反过来冲掉它的提示），
-            // 变成「有时提示在、有时不在」。顺序定死：先落盘开录 → 再推状态。
             self.startNativeWatch()
+            Diag.note("开录：startRecording 已调用" + (micOK ? "" : "（音频连接不在，这条可能没声音）"))
             self.movieOut.startRecording(to: url, recordingDelegate: self)
 
-            // 回读一次：startRecording 万一没被系统接受（不只是连接问题，极端情况下也会发生），
-            // 下面那个 main.async 就会把界面置成「正在录」，可实际什么都没写 ——
-            // 用户再点停录会走 stopRecording 的「没在录」分支，只是撤个标志就返回，
-            // 界面永远卡在录制态、计时器一直走。所以这里先确认真的在录，再往下推状态。
-            guard self.movieOut.isRecording else {
-                Diag.note("startRecording 没被接受：movieOut.isRecording == false")
-                // 刚才那个看门狗已经起来了，这里得收回，否则它会一直空转
-                self.stopNativeWatch()
-                DispatchQueue.main.async {
-                    self.recording = false
-                    self.recordingError = "开录失败，再点一次"
-                    self.finishing = false
-                }
-                return
-            }
-
-            // 注意用 async 不用 sync：cfgQ 上同步等主线程，主线程若正卡在等 cfgQ 就会死锁
+            // startRecording 是异步的：系统确认开录后会回调 didStartRecordingTo，
+            // 此刻立刻回读 isRecording 拿到的是 false —— v1.23 在这里误判
+            // 「开录失败」，界面不进录制态，但录制其实已经在跑（诊断里 39s/22.9s
+            // 的成片就是这么来的）。所以状态先推上去，1.2 秒后还没真正开录才判失败。
             DispatchQueue.main.async {
                 self.recordingError = micOK ? "" : "麦克风没接上，这条可能没有声音"
                 self.recording = true
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                // 真开录了（didStart 来了或 isRecording 已立起来）就不动；
+                // 中途用户点了停录（recording 已回 false）也不动。
+                guard let self, self.recording, !self.movieOut.isRecording else { return }
+                self.stopNativeWatch()
+                self.finishing = false
+                self.recordingError = "开录失败，再点一次"
+                self.recording = false
             }
         }
     }
@@ -1916,6 +1922,16 @@ extension CameraRecorder: AVCaptureVideoDataOutputSampleBufferDelegate,
 // MARK: - 原相机录制回调
 
 extension CameraRecorder: AVCaptureFileOutputRecordingDelegate {
+    /// 系统真正开始写文件时回调（startRecording 是异步的，开录确认在这里）。
+    /// 连接列表里有没有音频口，是「这条片子会不会有声音」的第一手证据。
+    func fileOutput(_ output: AVCaptureFileOutput,
+                    didStartRecordingTo fileURL: URL,
+                    from connections: [AVCaptureConnection]) {
+        let audio = connections.contains { c in c.ports.contains { $0.mediaType == .audio } }
+        Diag.note("开录确认：音轨连接=\(audio ? "有" : "无")")
+        DispatchQueue.main.async { self.recording = true }
+    }
+
     func fileOutput(_ output: AVCaptureFileOutput,
                     didFinishRecordingTo outputFileURL: URL,
                     from connections: [AVCaptureConnection],
