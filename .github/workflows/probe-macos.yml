@@ -1,0 +1,37 @@
+name: probe-macos
+
+# 临时探针：一次性探清哪些 macOS runner 标签真的能拿到机器。
+# 每个 job 只跑一句 sw_vers，拿不到机器的会在 timeout 后被取消。
+on:
+  workflow_dispatch:
+
+jobs:
+  m-latest:
+    runs-on: macos-latest
+    timeout-minutes: 8
+    steps:
+      - run: echo "macos-latest ok"; sw_vers; xcodebuild -version || true
+
+  m15:
+    runs-on: macos-15
+    timeout-minutes: 8
+    steps:
+      - run: echo "macos-15 ok"; sw_vers
+
+  m15-intel:
+    runs-on: macos-15-intel
+    timeout-minutes: 8
+    steps:
+      - run: echo "macos-15-intel ok"; sw_vers
+
+  m26:
+    runs-on: macos-26
+    timeout-minutes: 8
+    steps:
+      - run: echo "macos-26 ok"; sw_vers
+
+  ubuntu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: echo "ubuntu ok"
