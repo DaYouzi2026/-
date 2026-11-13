@@ -114,11 +114,7 @@ final class CameraRecorder: NSObject, ObservableObject {
     private var nativeWatch: DispatchSourceTimer?
     private var watchOn = false
 
-    // ── v1.25 长录音健康监视（都只在 audioQ 上读写）─────────────────
-    /// movieOut 音轨连接连续失效的体检次数（0.5s 一次），连续 4 次就挂备份兜底
-    private var nativeConnDeadTicks = 0
-    /// 备份兜底已接管：备份和跟读改由独立引擎的帧喂，session 这一路全部让位
-    private var nativeMicFallback = false
+    // ── v1.26 长录音监视（都只在 audioQ 上读写）─────────────────
     /// 健康日志节拍（每 15 秒记一条）
     private var healthTick = 0
     /// 本次开录的墙钟时刻（hostTime）。成片时长和它一比，时长造假一目了然
@@ -610,12 +606,31 @@ final class CameraRecorder: NSObject, ObservableObject {
             }
             session.addInput(ai)
             audioIn = ai
-            Diag.note("音频输入：已挂进相机会话（movieOut 会一起写音轨）")
+            // 新挂进来的音频输入会自动给 movieOut 建一条音频连接，这里立刻掐掉
+            disableMovieAudioTrack()
+            Diag.note("音频输入：已挂进相机会话（声音走 PCM 备份，movieOut 只写画面）")
             return true
         } catch {
             Diag.note("音频输入：建不起来 \(error.localizedDescription)")
             return false
         }
+    }
+
+    /// v1.26：让 movieOut 只写视频，音轨一律由我们自己的 PCM 备份合成。
+    ///
+    /// 为什么彻底放弃 movieOut 的音轨 —— 用户 v1.25 的诊断是决定性证据：
+    /// 648 秒的录制里，`录音健康` 每 15 秒都写着「距上帧=0.0s」，说明 audioOut
+    /// 一直在收帧、麦克风和音频会话完全正常；可成片「音轨=无」，连 11.5 秒的短条
+    /// 也一样。也就是：同一个音频输入同时挂给 movieOut 和 audioOut 时，
+    /// 帧会被 audioOut 吃掉，movieOut 一个采样都写不进 mp4。
+    /// 它偶尔能写（v1.24 那两条 3.6s/6.9s 有声），这种「有时行有时不行」的路，
+    /// 不能再当唯一音源 —— 这就是连续三个版本修不好的真正原因。
+    ///
+    /// 关掉它还有第二个好处：mp4 再也不可能出现「音轨存在、内容全是静音」的坏片，
+    /// 那种片子过得了「有没有音轨」的检查，用户听到的却是哑的。
+    private func disableMovieAudioTrack() {
+        guard let ac = movieOut.connection(with: .audio) else { return }
+        if ac.isEnabled { ac.isEnabled = false }
     }
 
     /// 切模式时同步音频输入。
@@ -651,6 +666,7 @@ final class CameraRecorder: NSObject, ObservableObject {
             if let c = movieOut.connection(with: .video), c.isVideoOrientationSupported {
                 c.videoOrientation = .portrait
             }
+            disableMovieAudioTrack()
         } else {
             videoOut.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)]
             videoOut.alwaysDiscardsLateVideoFrames = true
@@ -895,18 +911,17 @@ final class CameraRecorder: NSObject, ObservableObject {
                 return
             }
 
-            // 音频连接在不在，决定了这条片子有没有声音
-            let micOK: Bool
-            if let ac = self.movieOut.connection(with: .audio) {
-                micOK = ac.isEnabled && self.audioIn != nil
-            } else {
-                micOK = false
-            }
+            // v1.26：声音不再靠 movieOut 写，改由 audioOut 的帧写进 PCM 备份、停录后合成。
+            // 所以这里要确认的是「音频输入还挂着」（audioOut 才有帧），而不是 movieOut 的连接。
+            let micOK = self.audioIn != nil
+            // audioIn 万一是刚补上的，movieOut 会顺手多出一条音频连接，开录前再掐一次
+            self.disableMovieAudioTrack()
 
             try? FileManager.default.removeItem(at: url)
             self.recStartWall = Date()
             self.startNativeWatch()
-            Diag.note("开录：startRecording 已调用" + (micOK ? "" : "（音频连接不在，这条可能没声音）"))
+            Diag.note("开录：startRecording 已调用（声音走 PCM 备份"
+                      + (micOK ? "" : "，⚠️ 音频输入不在") + "）")
             self.movieOut.startRecording(to: url, recordingDelegate: self)
 
             // startRecording 是异步的：系统确认开录后会回调 didStartRecordingTo，
@@ -929,29 +944,24 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
     }
 
-    /// 开录时把上一次 beauty 留下的备份清干净，并开始盯音频。
+    /// 开录前开一个新的 PCM 备份，并开始盯音频。
     ///
-    /// 为什么要清：native 根本不写备份，可「音轨校验」那条兜底会去读 backupURL ——
-    /// 而上一次美颜录制留下的 WAV 是 `endAudioBackup` 之后依然留在 backupURL 上的，
-    /// 不清就会把上一段的声音合成到这条片子上。
+    /// v1.26：native 现在**必须**自己录声音（movieOut 的音轨已被关掉），所以这里
+    /// 每次开录都会新建一个 WAV。上一条留下的文件必须先删掉 —— 否则「这条没声音」
+    /// 会被上一段的声音顶上，用户听到的是别人的台词。
     ///
-    /// 为什么用 sync：这里必须在 `movieOut.startRecording` **之前**真的清完。
-    /// 用 async 的话它排在开录之后，一条极短的 native 录制（用户手抖点两下）可能先停录、
-    /// 先进 `endAudioBackup`，那时旧 backupURL 还在 —— 于是「这条没声音」就被上一段的
-    /// 声音顶上了，用户听到的是别人的台词。audioQ 从不 sync 回 cfgQ，所以这里是安全的。
+    /// 为什么用 sync：这里必须在 `movieOut.startRecording` **之前**真的建好文件。
+    /// 用 async 的话它排在开录之后，前面几十毫秒的声音就落不进去了。
+    /// audioQ 从不 sync 回 cfgQ，所以这里是安全的。
     private func startNativeWatch() {
         audioQ.sync {
-            self.backupOn = false
-            // 先把可能还开着的句柄关掉（上一次 beauty 被中断时留下的），再清地址和计数
-            self.closeBackupFile()
-            self.backupURL = nil
-            self.backupFrames = 0
+            // v1.26：native 现在自己录声音 —— 开录前先把上一条留下的 WAV 清干净，
+            // 再开一个新的。不清就会把上一段的声音合成进这条片子（听到别人的台词）。
+            self.openNativeBackupLocked()
 
             self.watchOn = true
             self.audioWarned = false
             self.audioNextRetry = 0
-            self.nativeConnDeadTicks = 0
-            self.nativeMicFallback = false
             self.healthTick = 0
             self.recordStartNativeAt = CACurrentMediaTime()
             // 用「现在」当基准，别拿上一次录制留下的旧时间戳算断流
@@ -965,45 +975,19 @@ final class CameraRecorder: NSObject, ObservableObject {
                 let now = CACurrentMediaTime()
                 let gap = now - self.lastAudioFrameAt
 
-                // ① 音轨连接体检（v1.25 新增）。
-                // 用户实测过这种状态：audioOut 的帧一直在流（麦克风是活的），
-                // movieOut 的音频连接却被系统停用/仲裁掉 —— 画面正常录了十几分钟，
-                // 成片音轨=无。每 0.5 秒看一眼连接状态：停用先试着手动拉起；
-                // 连续 2 秒救不回来，立刻挂上独立引擎备份，停录后自动合成音轨。
-                if !self.nativeMicFallback {
-                    var state = "无"
-                    var dead = true
-                    if let ac = self.movieOut.connection(with: .audio) {
-                        dead = !ac.isEnabled
-                        state = ac.isEnabled ? "启用" : "停用"
-                    }
-                    if dead {
-                        self.nativeConnDeadTicks += 1
-                        if self.nativeConnDeadTicks == 1 {
-                            var re = "（无连接）"
-                            if let ac = self.movieOut.connection(with: .audio) {
-                                ac.isEnabled = true
-                                re = ac.isEnabled ? "已拉起" : "拉起无效"
-                            }
-                            Diag.note("音轨连接失效（" + state + "），尝试恢复：" + re)
-                        }
-                        if self.nativeConnDeadTicks >= 4 {
-                            self.engageNativeFallback()
-                        }
-                    } else {
-                        self.nativeConnDeadTicks = 0
-                    }
-                }
-
-                // ② 每 15 秒一条健康日志：长录音中间发生了什么，一张截图全看清
+                // ① 每 15 秒一条健康日志：录了多久、离上一帧多久、备份已经写了多长。
+                // v1.26 起成片的音轨完全来自这份备份，所以「备份=xxxs」这一项才是
+                // 判断「这条有没有声音」的真凭据 —— 它和 t 一起涨，就说明声音一直在写。
                 self.healthTick += 1
                 if self.healthTick % 30 == 0 {
-                    Diag.note(String(format: "录音健康 t=%.0fs 距上帧=%.1fs 备份=%@",
-                                     now - self.recordStartNativeAt, gap,
-                                     self.nativeMicFallback ? "开" : "关"))
+                    let secs = self.backupRate > 1
+                        ? Double(self.backupFrames) / self.backupRate : 0
+                    Diag.note(String(format: "录音健康 t=%.0fs 距上帧=%.1fs 备份=%.1fs%@",
+                                     now - self.recordStartNativeAt, gap, secs,
+                                     self.backupOn ? "" : "（已停写）"))
                 }
 
-                // ③ 音频帧断流恢复（原有逻辑）：最多每 2 秒抢一次，
+                // ② 音频帧断流恢复：最多每 2 秒抢一次，
                 // 反复 setCategory 本身就会打断采集。只重新激活音频路由，
                 // 绝不动 session —— 一停就把这段录制收尾了。
                 guard gap > 1.2, now >= self.audioNextRetry else { return }
@@ -1020,17 +1004,7 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
     }
 
-    /// movieOut 的音轨救不回来时的最后手段：把麦克风交给独立引擎写备份 WAV。
-    /// 停录后走 repairAudioIfNeeded —— 成片有音轨就直接交付（备份作废），
-    /// 没有就用备份合成。时间轴不用担心：MicTap 的 sec 一直以开录时刻为基准，
-    /// 备份按 PTS 落位、空洞自动补静音，连接失效的那段时间会被补成无声。
-    private func engageNativeFallback() {
-        guard !self.nativeMicFallback, self.modeFlag == .native, self.watchOn else { return }
-        self.nativeMicFallback = true
-        Diag.note("音轨连接救不回来，改用独立引擎录音兜底（停录后自动合成音轨）")
-        self.beginAudioBackup()
-    }
-
+    /// 停录后走 repairAudioIfNeeded：声音来自 audioOut 写下的 PCM 备份。
     private func stopNativeWatch() {
         audioQ.async {
             self.watchOn = false
@@ -1161,6 +1135,44 @@ final class CameraRecorder: NSObject, ObservableObject {
 
     // MARK: - 音频备份（兜住「这条没声音」）
 
+    /// native 专用：在 audioQ 上开一个 PCM 备份文件（调用方必须已经在这个队列上）。
+    ///
+    /// 和 `beginAudioBackup` 只差一点：**不启动 MicTap**。native 期间麦克风归相机会话
+    /// （audioOut 那一路），独立引擎这时候抢不到设备，硬起只会互相打架 ——
+    /// 而 audioOut 的帧是实测证明 100% 可靠的（648 秒录制里断流 0.0 秒）。
+    private func openNativeBackupLocked() {
+        backupOn = false
+        closeBackupFile()
+        backupFrames = 0
+        backupPadFrames = 0
+        firstAudioPts = -1
+        backupFmtWarned = false
+        offsetFixed = false
+        backupOffset = 0
+        recordStartAt = CACurrentMediaTime()
+        lastAudioAt = recordStartAt
+        backupRate = audioRate > 8000 ? audioRate : 48000
+        backupChannels = audioChannels > 0 ? audioChannels : 1
+
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tidanci-audio", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let u = dir.appendingPathComponent("backup.wav")
+        try? FileManager.default.removeItem(at: u)
+        backupURL = u
+
+        // 先占位 44 字节头，停录时回填长度
+        guard FileManager.default.createFile(atPath: u.path, contents: Data(count: 44)),
+              let h = FileHandle(forWritingAtPath: u.path) else {
+            backupURL = nil
+            Diag.note("声音备份：文件建不起来（磁盘满了？），这条可能没有声音")
+            return
+        }
+        try? h.seekToEnd()
+        backupHandle = h
+        backupOn = true
+    }
+
     /// 开录时在临时目录挂一个 CAF，把麦克风 PCM 原样写进去。正常情况用不上；
     /// 一旦相机会话没把音轨写进文件（首次启动最容易），就拿它把声音补回去。
     private func beginAudioBackup() {
@@ -1265,7 +1277,6 @@ final class CameraRecorder: NSObject, ObservableObject {
         } else {
             micFailed = true
             // 引擎起不来：备份和跟读交还给相机会话那一路（session 帧继续喂）
-            nativeMicFallback = false
             Diag.note("麦克风：独立引擎起不来（\(mic.lastError)），退回相机音频")
             fallbackToSessionAudio()
         }
@@ -1519,41 +1530,34 @@ final class CameraRecorder: NSObject, ObservableObject {
 
     // MARK: - 原相机停录后的自检
 
-    /// native 停录后只做一件事：确认这条 mp4 里到底有没有音轨。
+    /// native 停录后的收尾：把 PCM 备份里的声音合成进画面文件。
     ///
-    /// 正常情况下 session 挂着麦克风、movieOut 把音视频一起写，这一步是「读一下文件头」
-    /// 级别的开销，**不做任何合成**，所以停录即可交付 —— 用户抱怨的「存半天」就是
-    /// 以前那条无条件补音链路。
+    /// ── v1.26：这段逻辑整个改了方向 ─────────────────────────────
+    /// v1.23～v1.25 一直在「确认 movieOut 有没有把音轨写进去，写了就直接交付」，
+    /// 而用户实测把这条路彻底否掉了：648 秒的录制里 audioOut 每 15 秒都报
+    /// 「距上帧=0.0s」（麦克风、音频会话全程正常），成片却「音轨=无」，
+    /// 连 11.5 秒的短条也一样。结论：同一个音频输入同时挂给 movieOut 和 audioOut 时，
+    /// 帧会被 audioOut 吃掉，movieOut 一个采样都写不进去。
     ///
-    /// 万一音轨真的没写进去（极少见：音频连接恰好在这一条开始时没建起来），
-    /// 有备份就用备份合成，没有就把话说清楚，绝不静默交付一条哑片。
+    /// 所以现在 movieOut 开录前就被关掉了音轨连接（只写画面），声音一律由 audioOut
+    /// 的帧写进 PCM 备份、停录后合成进来 —— 不再有「系统这次写没写」这个变量。
     /// 开录的墙钟时刻。成片报告的时长和它一比，容器时长造假一眼看穿
     private var recStartWall = Date()
 
-    private func verifyNativeAudio(_ video: URL, done: @escaping (URL?) -> Void) {
+    private func finalizeNativeAudio(_ video: URL, done: @escaping (URL?) -> Void) {
         let wall = Date().timeIntervalSince(recStartWall)
         DispatchQueue.global(qos: .userInitiated).async {
             let asset = AVURLAsset(url: video)
             let hasAudio = !asset.tracks(withMediaType: .audio).isEmpty
             let len = asset.duration.seconds
-            Diag.note("原相机成片：\(String(format: "%.1f", len))s（墙钟 "
-                      + String(format: "%.1f", wall) + "s）音轨="
-                      + (hasAudio ? "有（直接交付，不合成）" : "无（走兜底）"))
+            Diag.note("原相机画面：\(String(format: "%.1f", len))s（墙钟 "
+                      + String(format: "%.1f", wall) + "s）自带音轨="
+                      + (hasAudio ? "有（仍用备份重建，避免静音音轨混过去）" : "无"))
 
-            guard !hasAudio else {
-                DispatchQueue.main.async {
-                    // 成片确实有声，就把开录时看门狗 / 中断路径留下的旧提示清掉 ——
-                    // 否则用户会看到「明明有声音，界面还在喊没声音」。
-                    self.recordingError = ""
-                    done(video)
-                }
-                return
-            }
-
-            // 走到这里说明这一条确实是哑的，只能走老路：有备份就补，没备份就报清楚。
-            // 提示直接换成这一条的事实描述，不要把旧文案（比如「麦克风没在出数据」）留在界面上。
+            // 不管自带音轨有没有，都走备份合成：自带那条可能是「音轨存在、内容全静音」，
+            // 光看有没有轨道是判不出来的 —— 这正是前几个版本反复翻车的地方。
             DispatchQueue.main.async {
-                self.recordingError = "这条没录到声音，画面已保存"
+                self.recordingError = ""
                 self.tidying = true
                 self.repairAudioIfNeeded(video) { url in
                     self.tidying = false
@@ -1580,9 +1584,9 @@ final class CameraRecorder: NSObject, ObservableObject {
                 let hasAudio = !av.tracks(withMediaType: .audio).isEmpty
                 Diag.note("没有可用备份，成片音轨=\(hasAudio ? "有" : "无")")
                 if !hasAudio {
-                    // native 走到这里时备份必然是 nil（录制期间压根没写），所以这句一定会
-                    // 覆写掉 verifyNativeAudio 刚写的「画面已保存」。两句合成一句说清楚：
-                    // 画面留住了、声音没有、该怎么办。
+                    // v1.26：native 的备份是必写的，走到这里只有两种可能 ——
+                    // 备份文件建不起来（磁盘满），或者麦克风整场没出过一帧。
+                    // 不管是哪种，画面留住了、声音没有，必须明说并要求重录。
                     DispatchQueue.main.async { self.recordingError = "画面已保存，但没录到声音，建议重录" }
                 }
                 done(video)
@@ -1958,18 +1962,14 @@ final class CameraRecorder: NSObject, ObservableObject {
             writer.append(audio: sb)
         }
 
-        // native 这一路只负责两件事：把格式/时间戳记下来，并把 PCM 交给跟读识别。
-        // 录制的音轨由 movieOut 自己从同一个音频输入写。
-        // v1.25：一旦备份兜底接管（nativeMicFallback），备份和跟读都改由独立引擎的
-        // 帧喂 —— session 这路必须全部让位，否则同一段声音写两遍备份、
-        // 识别收到两路交错的音频，全都乱套。
+        // native：这一路既喂跟读识别，又把 PCM 写进备份 —— v1.26 起成片的音轨
+        // 完全来自这份备份（movieOut 只写画面），所以这里断不得。
+        // beauty：只有独立引擎起不来时才走这路，同样写备份 + 喂识别。
         if let pcm = CameraRecorder.toPCM(sb) {
-            if backupOn, !nativeMicFallback {
+            if backupOn {
                 appendAudioBackup(pcm, pts: CMSampleBufferGetPresentationTimeStamp(sb))
             }
-            if !nativeMicFallback {
-                onAudio?(pcm)
-            }
+            onAudio?(pcm)
         }
     }
 
@@ -2007,7 +2007,7 @@ extension CameraRecorder: AVCaptureVideoDataOutputSampleBufferDelegate,
 
 extension CameraRecorder: AVCaptureFileOutputRecordingDelegate {
     /// 系统真正开始写文件时回调（startRecording 是异步的，开录确认在这里）。
-    /// 音频连接「存在」和「启用」是两回事：存在但停用，这条片子照样是哑的。
+    /// v1.26 起画面文件只写视频轨，所以这里只用来确认「真的开始录了」并把连接状态记进诊断。
     func fileOutput(_ output: AVCaptureFileOutput,
                     didStartRecordingTo fileURL: URL,
                     from connections: [AVCaptureConnection]) {
@@ -2018,7 +2018,7 @@ extension CameraRecorder: AVCaptureFileOutputRecordingDelegate {
             for p in c.inputPorts where p.mediaType == .audio { hasAudio = true }
             if hasAudio { audioDesc = c.isEnabled ? "有·启用" : "有·停用" }
         }
-        Diag.note("开录确认：音轨连接=\(audioDesc)")
+        Diag.note("开录确认：画面已开录（音轨连接=\(audioDesc)，声音由 PCM 备份合成）")
         DispatchQueue.main.async { self.recording = true }
     }
 
@@ -2057,8 +2057,8 @@ extension CameraRecorder: AVCaptureFileOutputRecordingDelegate {
                 }
 
                 if wasNative {
-                    // 系统相机同款：音视频本来就在同一个文件里，确认音轨在就立刻交付。
-                    self.verifyNativeAudio(video) { url in
+                    // v1.26：画面文件只有视频轨，声音一律现合成，没有「系统这次写没写」这个变量
+                    self.finalizeNativeAudio(video) { url in
                         self.deliver(url)
                     }
                     return
