@@ -881,6 +881,23 @@ final class CameraRecorder: NSObject, ObservableObject {
             // 变成「有时提示在、有时不在」。顺序定死：先落盘开录 → 再推状态。
             self.startNativeWatch()
             self.movieOut.startRecording(to: url, recordingDelegate: self)
+
+            // 回读一次：startRecording 万一没被系统接受（不只是连接问题，极端情况下也会发生），
+            // 下面那个 main.async 就会把界面置成「正在录」，可实际什么都没写 ——
+            // 用户再点停录会走 stopRecording 的「没在录」分支，只是撤个标志就返回，
+            // 界面永远卡在录制态、计时器一直走。所以这里先确认真的在录，再往下推状态。
+            guard self.movieOut.isRecording else {
+                Diag.note("startRecording 没被接受：movieOut.isRecording == false")
+                // 刚才那个看门狗已经起来了，这里得收回，否则它会一直空转
+                self.stopNativeWatch()
+                DispatchQueue.main.async {
+                    self.recording = false
+                    self.recordingError = "开录失败，再点一次"
+                    self.finishing = false
+                }
+                return
+            }
+
             // 注意用 async 不用 sync：cfgQ 上同步等主线程，主线程若正卡在等 cfgQ 就会死锁
             DispatchQueue.main.async {
                 self.recordingError = micOK ? "" : "麦克风没接上，这条可能没有声音"
@@ -892,9 +909,15 @@ final class CameraRecorder: NSObject, ObservableObject {
     /// 开录时把上一次 beauty 留下的备份清干净，并开始盯音频。
     ///
     /// 为什么要清：native 根本不写备份，可「音轨校验」那条兜底会去读 backupURL ——
-    /// 上一次美颜录制的旧 WAV 要是还在，就可能把上一段的声音合成到这条片子上。
+    /// 而上一次美颜录制留下的 WAV 是 `endAudioBackup` 之后依然留在 backupURL 上的，
+    /// 不清就会把上一段的声音合成到这条片子上。
+    ///
+    /// 为什么用 sync：这里必须在 `movieOut.startRecording` **之前**真的清完。
+    /// 用 async 的话它排在开录之后，一条极短的 native 录制（用户手抖点两下）可能先停录、
+    /// 先进 `endAudioBackup`，那时旧 backupURL 还在 —— 于是「这条没声音」就被上一段的
+    /// 声音顶上了，用户听到的是别人的台词。audioQ 从不 sync 回 cfgQ，所以这里是安全的。
     private func startNativeWatch() {
-        audioQ.async {
+        audioQ.sync {
             self.backupOn = false
             // 先把可能还开着的句柄关掉（上一次 beauty 被中断时留下的），再清地址和计数
             self.closeBackupFile()
@@ -952,8 +975,13 @@ final class CameraRecorder: NSObject, ObservableObject {
                 if self.movieOut.isRecording {
                     self.movieOut.stopRecording()
                 } else {
-                    // 没在录：撤销刚才那个标志，否则 stop() 会一直等下去
-                    DispatchQueue.main.async { self.finishing = false }
+                    // 没在录：撤销刚才那个标志，否则 stop() 会一直等下去。
+                    // 顺便把「正在录」也撤掉 —— 开录失败那条路径上界面已经置成录制态了，
+                    // 不撤的话计时器会一直走，用户只能退出页面。
+                    DispatchQueue.main.async {
+                        self.finishing = false
+                        self.recording = false
+                    }
                 }
             }
             return
@@ -1467,7 +1495,10 @@ final class CameraRecorder: NSObject, ObservableObject {
                 let hasAudio = !av.tracks(withMediaType: .audio).isEmpty
                 Diag.note("没有可用备份，成片音轨=\(hasAudio ? "有" : "无")")
                 if !hasAudio {
-                    DispatchQueue.main.async { self.recordingError = "这条没录到声音，建议重录" }
+                    // native 走到这里时备份必然是 nil（录制期间压根没写），所以这句一定会
+                    // 覆写掉 verifyNativeAudio 刚写的「画面已保存」。两句合成一句说清楚：
+                    // 画面留住了、声音没有、该怎么办。
+                    DispatchQueue.main.async { self.recordingError = "画面已保存，但没录到声音，建议重录" }
                 }
                 done(video)
                 return
