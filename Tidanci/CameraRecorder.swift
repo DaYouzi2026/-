@@ -128,7 +128,7 @@ final class CameraRecorder: NSObject, ObservableObject {
     /// （一个拿走，另一个的音频就哑了），旧版每次开拍页都 new 一个，
     /// 长录音中途页面重建就会撞上 —— 统一成单例，这一类问题连根拔掉。
     static let shared = CameraRecorder()
-    private init() {}
+    private override init() {}
 
     /// 开录时刻的 hostTime。音频时间轴以它为 0 点，和视频 PTS 对齐。
     private var audioStartHost: UInt64 = 0
