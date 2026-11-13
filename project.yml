@@ -20,8 +20,8 @@ targets:
       path: Tidanci/Info.plist
       properties:
         CFBundleDisplayName: 提词大师
-        CFBundleShortVersionString: "1.20"
-        CFBundleVersion: "21"
+        CFBundleShortVersionString: "1.21"
+        CFBundleVersion: "22"
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -29,7 +29,7 @@ targets:
         UIStatusBarStyle: UIStatusBarStyleLightContent
         NSCameraUsageDescription: 拍摄视频需要用到相机
         NSMicrophoneUsageDescription: 录制视频里的声音需要用到麦克风
-        NSSpeechRecognitionUsageDescription: 语音跟读要用语音识别来判断你读到了哪里
+        NSSpeechRecognitionUsageDescription: 语音跟读用系统语音识别判断你读到了哪里。默认联网识别（更准），可在 App 内切换成仅本机识别，此时声音不出这台手机。
         NSPhotoLibraryAddUsageDescription: 把拍好的视频存进相册
     settings:
       base:
@@ -37,8 +37,8 @@ targets:
         PRODUCT_NAME: Tidanci
         TARGETED_DEVICE_FAMILY: "1"
         SWIFT_VERSION: "5.0"
-        MARKETING_VERSION: "1.20"
-        CURRENT_PROJECT_VERSION: "21"
+        MARKETING_VERSION: "1.21"
+        CURRENT_PROJECT_VERSION: "22"
         GENERATE_INFOPLIST_FILE: NO
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGNING_REQUIRED: NO

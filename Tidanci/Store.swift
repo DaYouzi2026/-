@@ -25,27 +25,45 @@ struct Script: Identifiable, Codable, Equatable {
     var durationText: String { Estimate.text(charCount) }
 
     var updatedText: String {
+        Script.stamp.string(from: updatedAt)
+    }
+
+    private static let stamp: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "MM-dd HH:mm"
-        return f.string(from: updatedAt)
-    }
+        return f
+    }()
 }
 
 struct WorkItem: Identifiable, Hashable {
     let url: URL
+    /// 体积和创建时间在扫目录时一次取好。
+    ///
+    /// 以前 `size` / `date` 是计算属性，每读一次就 stat 一次文件。作品页 6 个格子 ×
+    /// 两个属性、设置页再遍历一遍算总用量 —— 一次渲染能打出几十次文件系统调用，
+    /// 全发生在主线程上。列表一滑就掉帧，还平白耗电。
+    let bytes: Int64
+    let created: Date
+
+    init(url: URL, bytes: Int64? = nil, created: Date? = nil) {
+        self.url = url
+        if let b = bytes, let c = created {
+            self.bytes = b
+            self.created = c
+        } else {
+            let v = try? url.resourceValues(forKeys: [.fileSizeKey, .creationDateKey])
+            self.bytes = bytes ?? Int64(v?.fileSize ?? 0)
+            self.created = created ?? v?.creationDate ?? Date()
+        }
+    }
+
     var id: URL { url }
 
     var name: String { url.deletingPathExtension().lastPathComponent }
 
-    var size: Int64 {
-        let v = try? url.resourceValues(forKeys: [.fileSizeKey])
-        return Int64(v?.fileSize ?? 0)
-    }
+    var size: Int64 { bytes }
 
-    var date: Date {
-        let v = try? url.resourceValues(forKeys: [.creationDateKey])
-        return v?.creationDate ?? Date()
-    }
+    var date: Date { created }
 
     var sizeText: String {
         let mb = Double(size) / 1048576.0
@@ -53,10 +71,15 @@ struct WorkItem: Identifiable, Hashable {
     }
 
     var dateText: String {
+        WorkItem.stamp.string(from: date)
+    }
+
+    /// DateFormatter 初始化一次要几百微秒，列表里每格每帧新建一个就是纯浪费。
+    private static let stamp: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "MM-dd HH:mm"
-        return f.string(from: date)
-    }
+        return f
+    }()
 }
 
 final class Store: ObservableObject {
@@ -79,6 +102,12 @@ final class Store: ObservableObject {
 
     init() {
         try? fm.createDirectory(at: worksDir, withIntermediateDirectories: true)
+        // 作品动辄几百 MB 到几 GB。进 iCloud 备份没有意义，还会把用户的空间和
+        // 新机恢复时间一起吃掉 —— 明确排除掉。
+        var dir = worksDir
+        var v = URLResourceValues()
+        v.isExcludedFromBackup = true
+        try? dir.setResourceValues(v)
         loadScripts()
         refreshWorks()
     }
@@ -126,18 +155,29 @@ final class Store: ObservableObject {
     // MARK: - 作品
 
     func refreshWorks() {
+        let keys: [URLResourceKey] = [.creationDateKey, .fileSizeKey]
         let list = (try? fm.contentsOfDirectory(at: worksDir,
-                                                includingPropertiesForKeys: [.creationDateKey, .fileSizeKey],
+                                                includingPropertiesForKeys: keys,
                                                 options: [.skipsHiddenFiles])) ?? []
         let filtered = list.filter { $0.pathExtension.lowercased() == "mp4" || $0.pathExtension.lowercased() == "mov" }
-        works = filtered.map { WorkItem(url: $0) }.sorted { $0.date > $1.date }
+        // 一次把元数据带上，后面列表怎么重绘都不再碰文件系统
+        works = filtered.map { url in
+            let v = try? url.resourceValues(forKeys: Set(keys))
+            return WorkItem(url: url,
+                            bytes: Int64(v?.fileSize ?? 0),
+                            created: v?.creationDate ?? Date())
+        }.sorted { $0.date > $1.date }
     }
 
     func newWorkURL() -> URL {
+        worksDir.appendingPathComponent("拍_\(Store.stamp.string(from: Date())).mp4")
+    }
+
+    private static let stamp: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyyMMdd_HHmmss"
-        return worksDir.appendingPathComponent("拍_\(f.string(from: Date())).mp4")
-    }
+        return f
+    }()
 
     func deleteWork(_ item: WorkItem) {
         try? fm.removeItem(at: item.url)

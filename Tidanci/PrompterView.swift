@@ -123,17 +123,29 @@ struct ScriptTextView: UIViewRepresentable {
             let total = (tv.text as NSString).length
             let end = max(0, min(parent.readEnd, total))
             guard end != lastReadEnd else { return }
+            let prev = lastReadEnd
             lastReadEnd = end
 
-            // 只改颜色：不碰布局、不碰 contentOffset，滚动动画就不会被打断
+            // v1.21：只改「变化的那一段」。
+            // 以前每认出一个字，就把整篇 n 个字全部重新上色两遍（白一遍、压暗一遍）。
+            // 一分钟的台本三四百字，跟读时一秒更新好几次，等于每秒给 textStorage
+            // 打几千次属性补丁 —— 布局管理器跟着失效，滚动就掉帧。
+            // 绝大多数时候光标只往前挪两三个字，增量刷这点就够了。
             tv.textStorage.beginEditing()
-            tv.textStorage.addAttribute(.foregroundColor,
-                                        value: UIColor.white,
-                                        range: NSRange(location: 0, length: total))
-            if end > 0 {
+            if prev < 0 || end < prev {
+                // 重排 / 回退 / 双击跳转：整篇刷白，再把已读段压暗
+                tv.textStorage.addAttribute(.foregroundColor,
+                                            value: UIColor.white,
+                                            range: NSRange(location: 0, length: total))
+                if end > 0 {
+                    tv.textStorage.addAttribute(.foregroundColor,
+                                                value: UIColor.white.withAlphaComponent(0.28),
+                                                range: NSRange(location: 0, length: end))
+                }
+            } else if end > prev {
                 tv.textStorage.addAttribute(.foregroundColor,
                                             value: UIColor.white.withAlphaComponent(0.28),
-                                            range: NSRange(location: 0, length: end))
+                                            range: NSRange(location: prev, length: end - prev))
             }
             tv.textStorage.endEditing()
         }
@@ -141,6 +153,34 @@ struct ScriptTextView: UIViewRepresentable {
 }
 
 // MARK: - 拍摄页
+
+/// 滚动目标缓存。
+///
+/// 算一次目标位置要 `ensureLayout` 整篇、再查一次行片段；跟读时它一秒被叫 30 次，
+/// 而光标一秒只往前挪几次 —— 两次识别之间目标根本没变，等于白排了二十几次版。
+/// 缓存 key 只有三个：光标、框高、文本长度。命中就直接返回上次的值。
+private final class ScrollTargetCache {
+    private var valid = false
+    private var cursor = -1
+    private var boxHeight: CGFloat = -1
+    private var textLength = -1
+    private var cached: CGFloat = 0
+
+    func hit(cursor c: Int, height: CGFloat, textLength len: Int) -> CGFloat? {
+        guard valid, cursor == c, textLength == len, abs(boxHeight - height) < 0.5 else { return nil }
+        return cached
+    }
+
+    func store(_ v: CGFloat, cursor c: Int, height: CGFloat, textLength len: Int) {
+        valid = true
+        cursor = c
+        boxHeight = height
+        textLength = len
+        cached = v
+    }
+
+    func invalidate() { valid = false }
+}
 
 struct PrompterView: View {
     @EnvironmentObject var store: Store
@@ -198,6 +238,8 @@ struct PrompterView: View {
     @State private var showBeauty = false
     @State private var askQuit = false
     @State private var ignoreBeautyChange = false
+    /// 滚动目标缓存（引用类型，改它不会触发 SwiftUI 重绘）
+    @State private var scrollCache = ScrollTargetCache()
 
     var body: some View {
         GeometryReader { geo in
@@ -268,6 +310,9 @@ struct PrompterView: View {
         .onChange(of: bSlim) { _ in pushBeauty() }
         .onChange(of: bEye) { _ in pushBeauty() }
         .onChange(of: bPreset) { _ in pushBeauty() }
+        // 字号/行距一变，整篇重新排版，缓存的滚动目标就作废
+        .onChange(of: fontSize) { _ in scrollCache.invalidate() }
+        .onChange(of: lineGap) { _ in scrollCache.invalidate() }
         .sheet(isPresented: $showSettings) { settingsSheet }
         .sheet(isPresented: $showBeauty) { BeautyPanel() }
         .confirmationDialog("正在录制，退出会丢掉这段视频",
@@ -322,6 +367,18 @@ struct PrompterView: View {
         return statusText
     }
 
+    /// 状态灯的语义：绿=正常跟读，蓝=匀速滚动，黄=有异常要处理，灰=待机
+    private var statusDot: Color {
+        if engine.prepared.isEmpty { return T.warn }
+        if followOn && speech.running {
+            let s = speech.status
+            if !s.isEmpty && s != "在线识别中" && s != "离线识别中" { return T.warn }
+            return T.ok
+        }
+        if autoScroll { return T.accent2 }
+        return Color.white.opacity(0.35)
+    }
+
     private var topBar: some View {
         VStack(spacing: 9) {
             HStack(spacing: 11) {
@@ -331,16 +388,22 @@ struct PrompterView: View {
                     RoundIconButton(icon: "xmark", size: 38, bg: Color.black.opacity(0.42))
                 }
                 .pressable()
+                .accessibilityLabel("退出拍摄")
 
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 3) {
                     Text(script.displayTitle)
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundColor(.white)
                         .lineLimit(1)
-                    Text(statusLine)
-                        .font(.system(size: 11))
-                        .foregroundColor(.white.opacity(0.66))
-                        .lineLimit(1)
+                    HStack(spacing: 5) {
+                        Circle()
+                            .fill(statusDot)
+                            .frame(width: 5, height: 5)
+                        Text(statusLine)
+                            .font(.system(size: 11))
+                            .foregroundColor(.white.opacity(0.72))
+                            .lineLimit(1)
+                    }
                 }
 
                 Spacer(minLength: 6)
@@ -363,6 +426,7 @@ struct PrompterView: View {
                 }
                 .disabled(cam.recording)
                 .pressable()
+                .accessibilityLabel("切换前后镜头")
             }
 
             progressBar
@@ -432,6 +496,7 @@ struct PrompterView: View {
                                     bg: beautyOn ? T.accent : Color.black.opacity(0.44))
                 }
                 .pressable()
+                .accessibilityLabel(beautyOn ? "美颜已开" : "打开美颜")
 
                 Spacer()
 
@@ -447,6 +512,7 @@ struct PrompterView: View {
                                     bg: Color.black.opacity(0.44))
                 }
                 .pressable()
+                .accessibilityLabel("提词设置")
             }
             .padding(.horizontal, 38)
             .padding(.top, 2)
@@ -495,10 +561,13 @@ struct PrompterView: View {
             .foregroundColor(active ? .white : Color.white.opacity(0.80))
             .frame(maxWidth: .infinity)
             .padding(.vertical, 8)
+            .contentShape(Rectangle())
             .background(active ? T.accent : Color.clear)
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
         .pressable()
+        .accessibilityLabel(label)
+        .accessibilityAddTraits(active ? .isSelected : [])
     }
 
     private func pill(_ text: String, mono: Bool = false) -> some View {
@@ -531,6 +600,7 @@ struct PrompterView: View {
             .animation(.easeInOut(duration: 0.18), value: cam.recording)
         }
         .pressable()
+        .accessibilityLabel(cam.recording ? "停止录制" : "开始录制")
     }
 
     private var countdownOverlay: some View {
@@ -542,6 +612,8 @@ struct PrompterView: View {
                     .font(.system(size: 136, weight: .bold, design: .rounded))
                     .foregroundColor(.white)
                     .shadow(color: Color.black.opacity(0.45), radius: 20)
+                    .id(countdownLeft)
+                    .transition(.scale(scale: 1.35).combined(with: .opacity))
             }
             // 长视频要重建音轨，直通也要几秒。不给点动静，用户会以为「录完什么都没发生」
             if cam.tidying {
@@ -885,9 +957,15 @@ struct PrompterView: View {
         let minY = -tv.contentInset.top
         guard n > 0 else { return minY }
 
-        let off = c >= n ? p.text.utf16.count : p.offsets[max(0, c)]
         let len = (tv.text as NSString).length
         guard len > 0 else { return minY }
+
+        // 同一个光标 + 同样的框高/文本，答案一定一样，不用再排一遍版
+        if let hit = scrollCache.hit(cursor: c, height: tv.bounds.height, textLength: len) {
+            return hit
+        }
+
+        let off = c >= n ? p.text.utf16.count : p.offsets[max(0, c)]
         let loc = min(max(0, off), len - 1)      // 行位置按「最后一个字」取
 
         let lm = tv.layoutManager
@@ -901,7 +979,9 @@ struct PrompterView: View {
         let used = lm.usedRect(for: tv.textContainer).height
         let contentH = used + tv.textContainerInset.top + tv.textContainerInset.bottom
         let maxY = max(minY, contentH + tv.contentInset.bottom - tv.bounds.height)
-        return min(max(tar, minY), maxY)
+        let result = min(max(tar, minY), maxY)
+        scrollCache.store(result, cursor: c, height: tv.bounds.height, textLength: len)
+        return result
     }
 
     /// 一拍跟随：每帧朝目标缓动。
@@ -927,6 +1007,7 @@ struct PrompterView: View {
     private func restart() {
         Haptics.tap()
         engine.reset(script.content)
+        scrollCache.invalidate()
         if let tv = textView {
             UIView.animate(withDuration: 0.3) {
                 tv.contentOffset = CGPoint(x: 0, y: -tv.contentInset.top)
@@ -960,11 +1041,11 @@ struct PrompterView: View {
     }
 
     private func startCountdown(_ n: Int) {
-        countdownLeft = n
+        withAnimation(.easeOut(duration: 0.22)) { countdownLeft = n }
         countTimer?.invalidate()
         countTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { timer in
             if countdownLeft > 1 {
-                countdownLeft -= 1
+                withAnimation(.easeOut(duration: 0.22)) { countdownLeft -= 1 }
                 Haptics.tap()
             } else {
                 timer.invalidate()
@@ -1035,16 +1116,19 @@ struct PrompterView: View {
 // MARK: - 触感
 
 enum Haptics {
+    // 每次点击新建一个生成器，第一次震动会有几十毫秒延迟（要现去唤醒 Taptic Engine）。
+    // 这里复用两个长生命周期的实例，点哪都跟手。
+    private static let impact = UIImpactFeedbackGenerator(style: .light)
+    private static let notify = UINotificationFeedbackGenerator()
+
     static func tap() {
-        let g = UIImpactFeedbackGenerator(style: .light)
-        g.prepare()
-        g.impactOccurred()
+        impact.prepare()
+        impact.impactOccurred()
     }
 
     static func success() {
-        let g = UINotificationFeedbackGenerator()
-        g.prepare()
-        g.notificationOccurred(.success)
+        notify.prepare()
+        notify.notificationOccurred(.success)
     }
 }
 

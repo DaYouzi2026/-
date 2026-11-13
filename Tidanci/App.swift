@@ -22,7 +22,7 @@ struct TidanciApp: App {
 
 struct RootView: View {
     @EnvironmentObject var store: Store
-    @State private var tab = 0
+    @AppStorage(Pref.tab) private var tab = 0
 
     var body: some View {
         TabView(selection: $tab) {
@@ -182,6 +182,7 @@ struct HomeView: View {
                     Text(s.preview)
                         .font(.system(size: 13))
                         .foregroundColor(T.sub)
+                        .lineSpacing(3)
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -200,11 +201,12 @@ struct HomeView: View {
                         .font(.system(size: 12, weight: .medium))
                         .foregroundColor(T.ink2)
                         .padding(.horizontal, 13)
-                        .padding(.vertical, 8)
+                        .frame(height: 36)
                         .background(T.surface2)
                         .clipShape(Capsule())
                 }
                 .pressable()
+                .accessibilityLabel("编辑 \(s.displayTitle)")
 
                 Button {
                     running = s
@@ -217,11 +219,12 @@ struct HomeView: View {
                     }
                     .foregroundColor(.white)
                     .padding(.horizontal, 15)
-                    .padding(.vertical, 8)
+                    .frame(height: 36)
                     .background(T.accent)
                     .clipShape(Capsule())
                 }
                 .pressable()
+                .accessibilityLabel("用这篇台本开拍")
             }
         }
         .card()
@@ -254,6 +257,7 @@ struct HomeView: View {
                     .shadow(color: Color.black.opacity(0.10), radius: 12, y: 6)
             }
             .pressable()
+            .accessibilityLabel("粘贴剪贴板里的文字，新建台本")
 
             Button {
                 editing = Script(title: "", content: "")
@@ -267,6 +271,7 @@ struct HomeView: View {
                     .shadow(color: T.accent.opacity(0.35), radius: 14, y: 7)
             }
             .pressable()
+            .accessibilityLabel("新建台本")
         }
         .padding(.trailing, 20)
         .padding(.bottom, 26)

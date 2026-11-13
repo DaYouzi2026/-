@@ -994,28 +994,7 @@ final class CameraRecorder: NSObject, ObservableObject {
             backupPadFrames += pad
         }
 
-        var data = Data()
-        data.reserveCapacity(frames * ch * 2)
-
-        if fmt.commonFormat == .pcmFormatFloat32, let src = pcm.floatChannelData {
-            let interleaved = fmt.isInterleaved
-            for i in 0..<frames {
-                for c in 0..<ch {
-                    let raw = interleaved ? src[0][i * ch + c] : src[c][i]
-                    let v = max(-1, min(1, raw))
-                    var s = Int16(v * 32767)
-                    withUnsafeBytes(of: &s) { data.append(contentsOf: $0) }
-                }
-            }
-        } else if fmt.commonFormat == .pcmFormatInt16, let src = pcm.int16ChannelData {
-            let interleaved = fmt.isInterleaved
-            for i in 0..<frames {
-                for c in 0..<ch {
-                    var s = interleaved ? src[0][i * ch + c] : src[c][i]
-                    withUnsafeBytes(of: &s) { data.append(contentsOf: $0) }
-                }
-            }
-        } else {
+        guard let data = Self.pcm16Data(pcm) else {
             // 32 位整数 / 定点：没见过，直接放弃备份，画面照录
             backupOn = false
             return
@@ -1035,6 +1014,63 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
 
         lastAudioAt = CACurrentMediaTime()
+    }
+
+    /// 任意 PCM → 16 位小端交错。
+    ///
+    /// 旧版是「每个采样点调一次 `withUnsafeBytes` 再 append 到 Data」：48kHz 单声道
+    /// 一秒就是 4.8 万次闭包 + 4.8 万次 Data 扩容判断，全压在录音线程上。
+    /// 录几分钟机身一热，这条线程跟不上，表现就是声音断流、备份缺帧。
+    /// 现在先一次分配 Int16 数组、裸指针写入，最后整块转 Data，量一样但开销降一个数量级。
+    private static func pcm16Data(_ pcm: AVAudioPCMBuffer) -> Data? {
+        let fmt = pcm.format
+        let frames = Int(pcm.frameLength)
+        let ch = Int(fmt.channelCount)
+        guard frames > 0, ch > 0 else { return nil }
+
+        var samples = [Int16](repeating: 0, count: frames * ch)
+        let ok = samples.withUnsafeMutableBufferPointer { out -> Bool in
+            guard let dst = out.baseAddress else { return false }
+
+            switch fmt.commonFormat {
+            case .pcmFormatFloat32:
+                guard let src = pcm.floatChannelData else { return false }
+                if fmt.isInterleaved {
+                    let p = src[0]
+                    for i in 0..<(frames * ch) {
+                        let v = max(-1, min(1, p[i]))
+                        dst[i] = Int16(v * 32767)
+                    }
+                } else {
+                    for c in 0..<ch {
+                        let p = src[c]
+                        for i in 0..<frames {
+                            let v = max(-1, min(1, p[i]))
+                            dst[i * ch + c] = Int16(v * 32767)
+                        }
+                    }
+                }
+                return true
+
+            case .pcmFormatInt16:
+                guard let src = pcm.int16ChannelData else { return false }
+                if fmt.isInterleaved {
+                    let p = src[0]
+                    for i in 0..<(frames * ch) { dst[i] = p[i] }
+                } else {
+                    for c in 0..<ch {
+                        let p = src[c]
+                        for i in 0..<frames { dst[i * ch + c] = p[i] }
+                    }
+                }
+                return true
+
+            default:
+                return false
+            }
+        }
+        guard ok else { return nil }
+        return samples.withUnsafeBufferPointer { Data(buffer: $0) }
     }
 
     private func writeZeros(_ frames: Int, channels: Int, handle h: FileHandle) {

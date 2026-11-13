@@ -24,6 +24,10 @@ enum T {
                                      startPoint: .topLeading,
                                      endPoint: .bottomTrailing)
 
+    /// 最小点按区域（HIG：44×44）
+    static let touch: CGFloat = 44
+    static let shadow = Color.black.opacity(0.06)
+
     /// 按字符串生成稳定的品牌色，用来给台本卡片上色
     static func tint(_ seed: String) -> Color {
         var h: UInt64 = 5381

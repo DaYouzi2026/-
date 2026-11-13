@@ -1,0 +1,18 @@
+# 构建产物
+out/
+build/
+DerivedData/
+*.ipa
+*.xcarchive
+Payload/
+
+# 工程文件由 xcodegen 生成
+Tidanci.xcodeproj/
+
+# 绝不要提交：本机推送用的 GitHub token
+github_token.txt
+*.token
+.env
+
+# 系统
+.DS_Store

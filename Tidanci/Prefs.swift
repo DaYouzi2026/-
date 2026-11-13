@@ -13,6 +13,10 @@ enum Pref {
     static let autoSave = "p.autoSave"
     static let followOn = "p.followOn"
     static let dimRead = "p.dimRead"
+    /// 当前选中的 Tab（0 台本 / 1 作品 / 2 我的），空态按钮靠它跳转
+    static let tab = "p.tab"
+    /// 只用本机语音识别（声音不出手机）
+    static let speechOnDevice = "p.speechOnDevice"
     /// 前置镜头录制成镜像（与取景框一致）
     static let mirrorSave = "p.mirrorSave"
 

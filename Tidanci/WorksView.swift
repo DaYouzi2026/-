@@ -6,6 +6,8 @@ struct WorksView: View {
     @EnvironmentObject var store: Store
     @ObservedObject private var thumbs = ThumbStore.shared
 
+    @AppStorage(Pref.tab) private var tab = 0
+
     @State private var playing: WorkItem?
     @State private var tip: String?
 
@@ -26,9 +28,7 @@ struct WorksView: View {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 14) {
                             if store.works.isEmpty {
-                                EmptyState(icon: "video.slash",
-                                           title: "还没有拍过东西",
-                                           sub: "回到台本页，选一篇点「开拍」，录完就会存到这里")
+                                emptyBlock
                             } else {
                                 grid
                             }
@@ -38,15 +38,20 @@ struct WorksView: View {
                         .padding(.bottom, 40)
                     }
                 }
-
+            }
+            .overlay(alignment: .top) {
                 if let t = tip {
-                    Toast(text: t).padding(.top, 6)
+                    Toast(text: t)
+                        .padding(.top, 8)
+                        .transition(.opacity)
                 }
             }
             .navigationBarHidden(true)
             .onAppear {
                 store.refreshWorks()
-                ThumbStore.shared.reset()
+                // 只清理已经不存在的文件，别把整库缩略图清空——切个 Tab 回来就全丢，
+                // 再重新解码一遍，既慢又卡
+                thumbs.prune(keeping: Set(store.works.map { $0.url }))
             }
             .sheet(item: $playing) { w in
                 PlaySheet(item: w)
@@ -74,10 +79,36 @@ struct WorksView: View {
         )
     }
 
+    private var emptyBlock: some View {
+        VStack(spacing: 20) {
+            EmptyState(icon: "video.slash",
+                       title: "还没有拍过东西",
+                       sub: "在台本页选一篇稿子，点「开拍」，录完就出现在这里")
+            Button {
+                tab = 0
+            } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "text.alignleft")
+                        .font(.system(size: 13, weight: .bold))
+                    Text("去挑一篇台本")
+                        .font(.system(size: 14, weight: .semibold))
+                }
+                .foregroundColor(.white)
+                .padding(.horizontal, 20)
+                .frame(height: 44)
+                .background(T.grad)
+                .clipShape(Capsule())
+                .shadow(color: T.accent.opacity(0.28), radius: 12, x: 0, y: 5)
+            }
+            .pressable()
+        }
+        .frame(maxWidth: .infinity)
+    }
+
     private var grid: some View {
         LazyVGrid(columns: [GridItem(.flexible(), spacing: 12),
                             GridItem(.flexible(), spacing: 12)],
-                  spacing: 14) {
+                  spacing: 18) {
             ForEach(store.works) { w in
                 tile(w)
                     .onAppear { thumbs.load(w.url) }
@@ -85,41 +116,53 @@ struct WorksView: View {
         }
     }
 
+    /// 竖屏成片就该按竖屏的样子摆：3:4 的卡片比正方形更容易一眼认出是哪条。
     private func tile(_ w: WorkItem) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 7) {
             Button {
                 playing = w
             } label: {
                 ZStack {
                     thumbImage(w)
+                        .overlay(
+                            LinearGradient(colors: [Color.clear, Color.black.opacity(0.58)],
+                                           startPoint: .center,
+                                           endPoint: .bottom)
+                        )
 
                     Image(systemName: "play.circle.fill")
-                        .font(.system(size: 30))
-                        .foregroundColor(.white.opacity(0.94))
-                        .shadow(color: Color.black.opacity(0.35), radius: 6)
+                        .font(.system(size: 32))
+                        .foregroundColor(.white.opacity(0.95))
+                        .shadow(color: Color.black.opacity(0.35), radius: 8)
 
                     VStack {
-                        Spacer()
+                        Spacer(minLength: 0)
                         HStack {
-                            Spacer()
                             Text(timeText(w))
                                 .font(.system(size: 10, weight: .semibold, design: .monospaced))
                                 .foregroundColor(.white)
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 3)
-                                .background(Color.black.opacity(0.55))
+                                .background(Color.black.opacity(0.42))
                                 .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                            Spacer(minLength: 0)
                         }
-                        .padding(7)
+                        .padding(8)
                     }
                 }
-                .frame(height: 152)
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .aspectRatio(3.0 / 4.0, contentMode: .fit)
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(Color.black.opacity(0.05), lineWidth: 1)
+                )
+                .shadow(color: T.shadow, radius: 10, x: 0, y: 4)
             }
             .pressable()
+            .accessibilityLabel("播放 \(w.name)，时长 \(timeText(w))")
 
             Text(w.name)
-                .font(.system(size: 11, weight: .medium))
+                .font(.system(size: 12, weight: .medium))
                 .foregroundColor(T.ink2)
                 .lineLimit(1)
             Text(w.dateText + " · " + w.sizeText)

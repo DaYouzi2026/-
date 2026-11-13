@@ -14,6 +14,9 @@ struct RoundIconButton: View {
             .frame(width: size, height: size)
             .background(bg)
             .clipShape(Circle())
+            // 视觉上还是 38，但点按区域补到 44 —— 单手举着手机按，差 6pt 就是按不中
+            .frame(minWidth: T.touch, minHeight: T.touch)
+            .contentShape(Rectangle())
     }
 }
 

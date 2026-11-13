@@ -106,6 +106,18 @@ final class SpeechFollower: ObservableObject {
             onFail?("语音识别暂时不可用，稍等再试")
             return
         }
+        // 设置里勾了「只用本机识别」就一直走离线模型，不再为了准去偷跑联网。
+        // 这是隐私承诺：开关打开时，音频一个字节都不出这台手机。
+        if UserDefaults.standard.bool(forKey: Pref.speechOnDevice) {
+            if rec.supportsOnDeviceRecognition {
+                forceOnDevice = true
+            } else {
+                onFail?("这台设备还没装中文离线模型，关掉「只用本机识别」才能跟读")
+                return
+            }
+        } else {
+            forceOnDevice = false
+        }
         if wantRun && running { return }
         carry = ""
         lastText = ""
