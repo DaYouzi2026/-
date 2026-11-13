@@ -44,6 +44,12 @@ final class VideoEditor: ObservableObject {
     @Published var cueCount = 0
     /// 字幕识别出来了但没烧上（带字幕导出失败，改交无字幕成片）
     @Published var subtitleDropped = false
+    /// 本次处理已耗时（秒）。四分钟的片子要跑好几分钟，界面得有个东西在动，
+    /// 否则用户分不清「在识别」还是「已经卡死」。
+    @Published var elapsed: Double = 0
+
+    private var ticker: Timer?
+    private var startedAt: Date?
 
     private let workQ = DispatchQueue(label: "video.editor", qos: .userInitiated)
 
@@ -80,6 +86,7 @@ final class VideoEditor: ObservableObject {
         statusText = "读视频…"
         cueCount = 0
         subtitleDropped = false
+        startTicker()
 
         workQ.async {
             var notes: [String] = []
@@ -177,9 +184,37 @@ final class VideoEditor: ObservableObject {
 
     private func finish(_ url: URL?, _ err: String?) {
         DispatchQueue.main.async {
+            self.stopTicker()
             self.running = false
             if let e = err { self.statusText = e }
         }
+    }
+
+    // MARK: - 计时器
+
+    private func startTicker() {
+        stopTicker()
+        startedAt = Date()
+        elapsed = 0
+        let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self, let t0 = self.startedAt else { return }
+            self.elapsed = Date().timeIntervalSince(t0)
+        }
+        RunLoop.main.add(t, forMode: .common)   // 手指还在滑页面时也别停
+        ticker = t
+    }
+
+    private func stopTicker() {
+        ticker?.invalidate()
+        ticker = nil
+        startedAt = nil
+    }
+
+    /// 「1 分 20 秒」这种给人看的时间
+    static func clock(_ seconds: Double) -> String {
+        let s = max(0, Int(seconds.rounded()))
+        if s < 60 { return "\(s) 秒" }
+        return "\(s / 60) 分 \(s % 60) 秒"
     }
 
     // MARK: - 降噪
@@ -335,9 +370,11 @@ final class VideoEditor: ObservableObject {
         }
 
         let wav = Self.temp("speech.wav")
+        DispatchQueue.main.async { self.statusText = "抽取音轨…" }
         let audioLen = try extractAudio(asset, to: wav)
         guard audioLen > 0.3 else { throw Fail(msg: "音轨太短，没得识别") }
 
+        DispatchQueue.main.async { self.statusText = "切分段…" }
         let parts = try splitWAV(wav, chunkSeconds: 45)
         try? FileManager.default.removeItem(at: wav)
         guard !parts.isEmpty else { throw Fail(msg: "音频切不出来") }
@@ -357,6 +394,7 @@ final class VideoEditor: ObservableObject {
             let base = 0.48 + 0.22 * Double(idx) / Double(passes.count)
             let span = 0.22 / Double(passes.count)
             let (cues, ok, err) = runPass(parts, rec: rec, onDevice: p.onDevice,
+                                          passIndex: idx, passTotal: passes.count,
                                           progressBase: base, progressSpan: span)
             if ok == 0 {
                 lastErr = err
@@ -395,11 +433,17 @@ final class VideoEditor: ObservableObject {
     private func runPass(_ parts: [Piece],
                          rec: SFSpeechRecognizer,
                          onDevice: Bool,
+                         passIndex: Int,
+                         passTotal: Int,
                          progressBase: Double,
                          progressSpan: Double) -> (cues: [SubtitleCue], ok: Int, err: Error?) {
         var cues: [SubtitleCue] = []
         var ok = 0
         var lastErr: Error?
+
+        let t0 = Date()
+        let tag = onDevice ? "本机识别" : "联网识别"
+        let passInfo = passTotal > 1 ? "\(tag)（第 \(passIndex + 1)/\(passTotal) 遍）" : tag
 
         for (i, p) in parts.enumerated() {
             do {
@@ -417,8 +461,16 @@ final class VideoEditor: ObservableObject {
                 Diag.note("字幕：\(onDevice ? "本地" : "联网")第 \(i + 1)/\(parts.count) 段失败 "
                           + "\(error.localizedDescription)")
             }
+
+            let done = Double(i + 1) / Double(parts.count)
+            let spent = Date().timeIntervalSince(t0)
+            // 按已跑完的段推剩下几段 —— 每段都是独立请求，耗时比较平均，估得还算准
+            let remain = done > 0.001 ? spent / done - spent : 0
             DispatchQueue.main.async {
-                self.progress = progressBase + progressSpan * Double(i + 1) / Double(parts.count)
+                self.progress = progressBase + progressSpan * done
+                var line = "\(passInfo) · \(i + 1)/\(parts.count) 段"
+                if remain >= 3 { line += " · 约剩 \(Self.clock(remain))" }
+                self.statusText = line
             }
         }
         return (cues, ok, lastErr)

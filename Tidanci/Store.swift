@@ -4,8 +4,45 @@ import Combine
 struct Script: Identifiable, Codable, Equatable {
     var id = UUID()
     var title: String
-    var content: String
+    /// 正文一变就重算字数（见下面的 `chars`）
+    var content: String {
+        didSet {
+            if content != oldValue { chars = Script.countChars(content) }
+        }
+    }
     var updatedAt = Date()
+
+    /// 非空白字数，建对象时算一次、之后随 `content` 走。
+    ///
+    /// 原来 `charCount` 是计算属性：首页每张卡片渲染要扫全文三遍（标签一次、
+    /// 估时一次、搜索过滤再一次），长稿子几千字，滚动时全压在主线程上。
+    private(set) var chars: Int
+
+    init(id: UUID = UUID(), title: String, content: String, updatedAt: Date = Date()) {
+        self.id = id
+        self.title = title
+        self.content = content
+        self.updatedAt = updatedAt
+        self.chars = Script.countChars(content)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, title, content, updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        title = try c.decode(String.self, forKey: .title)
+        content = try c.decode(String.self, forKey: .content)
+        updatedAt = try c.decode(Date.self, forKey: .updatedAt)
+        // 老存档里没有字数，现算一遍，不信磁盘上的值
+        chars = Script.countChars(content)
+    }
+
+    static func countChars(_ s: String) -> Int {
+        s.reduce(0) { $1.isWhitespace ? $0 : $0 + 1 }
+    }
 
     var displayTitle: String {
         let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -13,16 +50,16 @@ struct Script: Identifiable, Codable, Equatable {
     }
 
     var preview: String {
-        let s = content.replacingOccurrences(of: "\n", with: " ")
+        // 只要开头 44 个字，没必要把整篇稿子替换一遍换行再截断
+        let head = String(content.prefix(160))
+        let s = head.replacingOccurrences(of: "\n", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return s.count > 44 ? String(s.prefix(44)) + "…" : s
     }
 
-    var charCount: Int {
-        content.filter { !$0.isWhitespace && !$0.isNewline }.count
-    }
+    var charCount: Int { chars }
 
-    var durationText: String { Estimate.text(charCount) }
+    var durationText: String { Estimate.text(chars) }
 
     var updatedText: String {
         Script.stamp.string(from: updatedAt)

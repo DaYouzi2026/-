@@ -368,16 +368,26 @@ struct EditorView: View {
                     .foregroundColor(T.ink)
                 Spacer()
                 Text("\(Int(editor.progress * 100))%")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
                     .foregroundColor(T.accent)
             }
 
             ProgressView(value: editor.progress)
                 .tint(T.accent)
 
-            Text(editor.statusText)
-                .font(.system(size: 11))
-                .foregroundColor(T.sub)
+            stepStrip
+
+            HStack(alignment: .top, spacing: 8) {
+                Text(editor.statusText)
+                    .font(.system(size: 11))
+                    .foregroundColor(T.sub)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 4)
+                // 计数器一直在动，才看得出「在跑」而不是「卡死」
+                Text("已用 \(VideoEditor.clock(editor.elapsed))")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(T.sub.opacity(0.8))
+            }
         }
         .padding(14)
         .background(T.surface)
@@ -386,6 +396,44 @@ struct EditorView: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .stroke(T.line, lineWidth: 1)
         )
+    }
+
+    /// 这次实际要走的几步（跟着开关变），完成的打勾、当前的染成主题色
+    private var steps: [(name: String, stage: EditStage)] {
+        var out: [(name: String, stage: EditStage)] = []
+        if denoise { out.append(("降噪", .denoise)) }
+        if subtitle { out.append(("字幕", .transcribe)) }
+        out.append(("合成", .render))
+        return out
+    }
+
+    private var stepStrip: some View {
+        HStack(spacing: 5) {
+            ForEach(Array(steps.enumerated()), id: \.offset) { pair in
+                let i = pair.offset
+                let s = pair.element
+                let done = editor.stage.rawValue > s.stage.rawValue
+                let now = editor.stage == s.stage
+                HStack(spacing: 4) {
+                    Image(systemName: done ? "checkmark.circle.fill" : "\(i + 1).circle.fill")
+                        .font(.system(size: 10, weight: .bold))
+                    Text(s.name)
+                        .font(.system(size: 11, weight: now ? .semibold : .regular))
+                }
+                .foregroundColor(done ? T.ok : (now ? T.accent : T.sub))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(now ? T.accent.opacity(0.12) : T.surface2)
+                .clipShape(Capsule())
+
+                if i < steps.count - 1 {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundColor(T.sub.opacity(0.5))
+                }
+            }
+            Spacer(minLength: 0)
+        }
     }
 
     // MARK: - 完成
