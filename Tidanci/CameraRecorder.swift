@@ -875,12 +875,17 @@ final class CameraRecorder: NSObject, ObservableObject {
             }
 
             try? FileManager.default.removeItem(at: url)
+            // 先真开录，再把「正在录」这套状态发到界面。
+            // 以前是在 startRecording 之前 main.async 置状态，那个异步块可能晚于开录执行，
+            // 会把开录后看门狗刚写进去的提示又冲掉（或反过来冲掉它的提示），
+            // 变成「有时提示在、有时不在」。顺序定死：先落盘开录 → 再推状态。
+            self.startNativeWatch()
+            self.movieOut.startRecording(to: url, recordingDelegate: self)
+            // 注意用 async 不用 sync：cfgQ 上同步等主线程，主线程若正卡在等 cfgQ 就会死锁
             DispatchQueue.main.async {
                 self.recordingError = micOK ? "" : "麦克风没接上，这条可能没有声音"
                 self.recording = true
             }
-            self.startNativeWatch()
-            self.movieOut.startRecording(to: url, recordingDelegate: self)
         }
     }
 
@@ -1423,12 +1428,19 @@ final class CameraRecorder: NSObject, ObservableObject {
                       + (hasAudio ? "有（直接交付，不合成）" : "无（走兜底）"))
 
             guard !hasAudio else {
-                DispatchQueue.main.async { done(video) }
+                DispatchQueue.main.async {
+                    // 成片确实有声，就把开录时看门狗 / 中断路径留下的旧提示清掉 ——
+                    // 否则用户会看到「明明有声音，界面还在喊没声音」。
+                    self.recordingError = ""
+                    done(video)
+                }
                 return
             }
 
-            // 走到这里说明这一条确实是哑的，只能走老路：有备份就补，没备份就报清楚
+            // 走到这里说明这一条确实是哑的，只能走老路：有备份就补，没备份就报清楚。
+            // 提示直接换成这一条的事实描述，不要把旧文案（比如「麦克风没在出数据」）留在界面上。
             DispatchQueue.main.async {
+                self.recordingError = "这条没录到声音，画面已保存"
                 self.tidying = true
                 self.repairAudioIfNeeded(video) { url in
                     self.tidying = false
@@ -1887,30 +1899,38 @@ extension CameraRecorder: AVCaptureFileOutputRecordingDelegate {
             }
         }
         let finished = ok
-        // 这一条是走哪条路录的，得在回调时刻定下来：后面可能已经在切模式了
-        let wasNative = modeFlag == .native
-        if wasNative { stopNativeWatch() }
+        let errMsg = msg
+        let video = outputFileURL
 
-        DispatchQueue.main.async {
-            self.recording = false
-            if !msg.isEmpty { self.recordingError = msg }
-            guard finished else {
-                self.endAudioBackup { _, _ in }
-                self.deliver(nil)
-                return
-            }
+        // 这里在系统自己的线程上，不能直接读 modeFlag（约定是只在 cfgQ 上读写）。
+        // 直接读是数据竞争：极端情况下正好赶上切模式，会把 beauty 的片子当 native 处理
+        // （少一次补音，成片是哑的）。所以分流整段挪到 cfgQ 上做决定。
+        // 注意：只往 main / audioQ 里 async，绝不 sync 回 cfgQ，否则自己等自己死锁。
+        cfgQ.async {
+            let wasNative = self.modeFlag == .native
+            if wasNative { self.stopNativeWatch() }
 
-            if wasNative {
-                // 系统相机同款：音视频本来就在同一个文件里，确认音轨在就立刻交付。
-                self.verifyNativeAudio(outputFileURL) { url in
+            DispatchQueue.main.async {
+                self.recording = false
+                if !errMsg.isEmpty { self.recordingError = errMsg }
+                guard finished else {
+                    self.endAudioBackup { _, _ in }
+                    self.deliver(nil)
+                    return
+                }
+
+                if wasNative {
+                    // 系统相机同款：音视频本来就在同一个文件里，确认音轨在就立刻交付。
+                    self.verifyNativeAudio(video) { url in
+                        self.deliver(url)
+                    }
+                    return
+                }
+
+                // 美颜这条路保持原样：writer 的音轨可能缺，靠备份 PCM 补
+                self.repairAudioIfNeeded(video) { url in
                     self.deliver(url)
                 }
-                return
-            }
-
-            // 美颜这条路保持原样：writer 的音轨可能缺，靠备份 PCM 补
-            self.repairAudioIfNeeded(outputFileURL) { url in
-                self.deliver(url)
             }
         }
     }
