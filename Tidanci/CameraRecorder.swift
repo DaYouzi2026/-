@@ -1930,7 +1930,7 @@ extension CameraRecorder: AVCaptureFileOutputRecordingDelegate {
         // 不用嵌套 contains：Swift 对这种写法类型推断会炸（CI 实测）
         var hasAudioPort = false
         for c in connections {
-            for p in c.ports where p.mediaType == .audio { hasAudioPort = true }
+            for p in c.inputPorts where p.mediaType == .audio { hasAudioPort = true }
         }
         Diag.note("开录确认：音轨连接=\(hasAudioPort ? "有" : "无")")
         DispatchQueue.main.async { self.recording = true }
