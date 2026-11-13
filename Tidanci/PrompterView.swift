@@ -188,7 +188,10 @@ struct PrompterView: View {
 
     let script: Script
 
-    @StateObject private var cam = CameraRecorder()
+    // 全 App 唯一的相机会话（单例）。每次开拍页都新建实例的话，两个
+    // AVCaptureSession 会抢麦克风 —— 一个拿走，另一个的音频整场变哑。
+    // 用单例后重新进页只是重启同一个会话，录制状态也能跨页面保留。
+    @ObservedObject private var cam = CameraRecorder.shared
     @StateObject private var speech = SpeechFollower()
     @StateObject private var engine = PrompterEngine()
 

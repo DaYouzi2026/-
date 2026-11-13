@@ -37,8 +37,14 @@ enum AudioSession {
         if s.category != .playAndRecord || s.mode != .videoRecording {
             applyVideo(s)
         }
-        // 重复激活是幂等的，便宜且安全
-        try? s.setActive(true, options: [])
+        // 激活失败绝不能吞掉：类别/模式看着都对但会话是死的，
+        // 视频照录、麦克风不响 —— 「整条没声音」就是这么来的
+        do {
+            try s.setActive(true, options: [])
+        } catch {
+            lastError = "activate:\(error.localizedDescription)"
+            Diag.note("音频会话激活失败：\(error.localizedDescription)")
+        }
         Diag.note("音频会话 \(s.category.rawValue)/\(s.mode.rawValue)"
                   + (lastError.isEmpty ? "" : "（降级：\(lastError)）"))
     }
