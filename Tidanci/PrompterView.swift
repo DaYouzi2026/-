@@ -202,6 +202,8 @@ struct PrompterView: View {
     @AppStorage(Pref.autoSave) private var autoSave = true
     @AppStorage(Pref.followOn) private var followOnStored = true
     @AppStorage(Pref.mirrorSave) private var mirrorSave = true
+    /// 视频防抖档位（0 关 / 1 标准 / 2 电影级）
+    @AppStorage(Pref.stabilization) private var stabilization = 1
 
     @AppStorage(Pref.beautyOn) private var beautyOn = false
     @AppStorage(Pref.bSmooth) private var bSmooth = 0.36
@@ -303,6 +305,7 @@ struct PrompterView: View {
         .onChange(of: qualityRaw) { _ in applyQuality() }
         .onChange(of: fpsSetting) { _ in applyQuality() }
         .onChange(of: mirrorSave) { v in cam.setMirrorSave(v) }
+        .onChange(of: stabilization) { v in cam.setStabilization(v) }
         .onChange(of: beautyOn) { v in switchMode(v) }
         .onChange(of: bSmooth) { _ in pushBeauty() }
         .onChange(of: bWhiten) { _ in pushBeauty() }
@@ -465,6 +468,12 @@ struct PrompterView: View {
         VStack(spacing: 12) {
             HStack(spacing: 8) {
                 pill(cam.presetText, mono: true)
+
+                // 防抖真的生效时才显示（关掉不占地方）；4K60 上电影级会被降档，
+                // 用户在这里就能看到「实际给了什么」，不用去设置页猜。
+                if !cam.stabilText.isEmpty {
+                    pill(cam.stabilText)
+                }
 
                 if cam.recording {
                     HStack(spacing: 5) {
@@ -857,6 +866,9 @@ struct PrompterView: View {
             cam.onAudio = { buf in speech.feed(buf) }
             cam.onFinish = { url in handleFinish(url) }
             cam.setMirrorSave(mirrorSave)
+            // 防抖要在 start 之前给：setStabilization 和 start 都排在 cfgQ 上，
+            // 先来的先执行，configure() 建连接时就能一次落到位。
+            cam.setStabilization(stabilization)
             cam.start(front: true,
                       quality: q,
                       fps: fpsSetting,

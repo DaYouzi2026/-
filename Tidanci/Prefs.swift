@@ -19,6 +19,8 @@ enum Pref {
     static let speechOnDevice = "p.speechOnDevice"
     /// 前置镜头录制成镜像（与取景框一致）
     static let mirrorSave = "p.mirrorSave"
+    /// 视频防抖档位：0 关 / 1 标准 / 2 电影级（存 Int，见 Stabilization）
+    static let stabilization = "p.stabilization"
 
     // 提词框
     static let boxX = "p.box.x"
@@ -79,6 +81,35 @@ enum FrameRate: Int, CaseIterable, Identifiable {
     var title: String { "\(rawValue)fps" }
     var note: String {
         rawValue == 60 ? "动作更顺滑，光线暗时噪点会多一点" : "通用帧率，暗光更稳"
+    }
+}
+
+/// 视频防抖。可选项：默认「标准」，和系统相机一致；走动多的口播可以上电影级。
+///
+/// 存的是 Int（@AppStorage 直接读），真正能不能生效由机型和当前画质决定 ——
+/// 4K60 上电影级基本都不支持，落地时逐档降级，最终档位由 CameraRecorder 发回界面。
+enum Stabilization: Int, CaseIterable, Identifiable {
+    case off = 0
+    case standard = 1
+    case cinematic = 2
+
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .off: return "关"
+        case .standard: return "标准"
+        case .cinematic: return "电影级"
+        }
+    }
+
+    /// 设置页里那一行小字：说清代价，别让用户以为「开了就一定更好」
+    var note: String {
+        switch self {
+        case .off: return "不防抖，手持走动会晃。画面最锐、最省电"
+        case .standard: return "和系统相机一样，手抖基本抹平，4K60 也支持"
+        case .cinematic: return "走动拍像上了稳定器，但高画质/高帧率可能不支持，会降回标准"
+        }
     }
 }
 

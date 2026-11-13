@@ -6,6 +6,8 @@ struct SettingsView: View {
 
     @AppStorage(Pref.quality) private var qualityRaw = "uhd"
     @AppStorage(Pref.fps) private var fps = 60
+    /// 视频防抖：0 关 / 1 标准 / 2 电影级
+    @AppStorage(Pref.stabilization) private var stabilization = 1
     @AppStorage(Pref.fontSize) private var fontSize = 34.0
     @AppStorage(Pref.speed) private var speed = 46.0
     @AppStorage(Pref.countdown) private var countdown = 3
@@ -22,6 +24,7 @@ struct SettingsView: View {
 
     private var quality: VideoQuality { VideoQuality(rawValue: qualityRaw) ?? .uhd }
     private var frame: FrameRate { FrameRate(rawValue: fps) ?? .fps30 }
+    private var stab: Stabilization { Stabilization(rawValue: stabilization) ?? .off }
 
     /// 体积已经在扫目录时算好，这里只是加法，不再逐个 stat 文件
     private var usedSpace: String {
@@ -194,7 +197,21 @@ struct SettingsView: View {
                 }
                 .pickerStyle(.segmented)
 
+                // 防抖：和系统相机一样给三档。画的是「意图」，实际档位由机型和当前画质决定，
+                // 拍摄页左下角那个小胶囊显示真正生效的那一档。
+                Picker("", selection: $stabilization) {
+                    ForEach(Stabilization.allCases) { s in
+                        Text(s.title).tag(s.rawValue)
+                    }
+                }
+                .pickerStyle(.segmented)
+
                 Text(quality.note + "；" + frame.note)
+                    .font(.system(size: 11))
+                    .foregroundColor(T.sub)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text("防抖：" + stab.note)
                     .font(.system(size: 11))
                     .foregroundColor(T.sub)
                     .fixedSize(horizontal: false, vertical: true)

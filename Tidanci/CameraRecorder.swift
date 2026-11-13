@@ -8,21 +8,27 @@ import ImageIO
 
 /// 相机 + 录制。两条通路：
 ///
-/// * 原相机（native）：AVCaptureMovieFileOutput 直接落盘，能 4K/60fps，画质最高。
+/// * 原相机（native）：AVCaptureMovieFileOutput 直接落盘，音视频写在同一个文件里，
+///   停录即可用，能 4K/60fps，画质最高。
 /// * 经典美颜（beauty）：AVCaptureVideoDataOutput → Core Image 美颜 → AVAssetWriter 落盘，
 ///   预览走 AVSampleBufferDisplayLayer。这条路走 GPU，1080P 封顶。
 ///
-/// 两条路共用一路音频：既喂语音识别，也喂录制。
+/// ── v1.22：native 回到「系统相机同款」，音频重新挂进 AVCaptureSession ──────────
+/// v1.20 为了躲「长录时音频连接先断」，把麦克风整个从相机会话里搬走，改用 MicTap
+/// （AVAudioEngine）单独采，成片再靠备份 WAV 合成音轨。代价是：
+///   · movieOut 录出来的 mp4 根本没有音轨，每次停录都得跑一遍 repairAudioIfNeeded，
+///     四分钟的片子要等好几秒 —— 用户说的「存半天」就是这一步；
+///   · 备份 WAV 一旦中途断掉，成片是哑的，编辑页自然「识别不出来」。
 ///
-/// ── v1.20：音频从相机会话里搬出来 ──────────────────────────
-/// 以前音频挂在 AVCaptureSession 上（AVCaptureAudioDataOutput），和视频共用一条命。
-/// 录长片时机身发热、相机管线降频，或者来个电话、蓝牙耳机掉线，音频连接会先被牺牲；
-/// 画面还在写，声音这条路死了 —— 而 `AVAudioSession` 怎么重设类别都救不回来，
-/// 因为 session 的 audio connection 不会自己重建。这就是「录久一点就没声」的真身。
+/// 系统相机自己是 session 里挂麦克风 input + AVCaptureMovieFileOutput，音视频一起写。
+/// 长录稳不稳，关键从来不是「把音频搬出去」，而是「被中断之后能不能自己接上」。
+/// 所以现在：
+///   ① native 的音频输入挂在 session 上，停录立刻交付带声音的 mp4，不再合成；
+///   ② 跟读识别改由 session 里的 AVCaptureAudioDataOutput 喂 onAudio（native 不再有 MicTap）；
+///   ③ 会话中断 / 运行时错误由通知接管，能恢复就 resumeRecording 接着录，恢复不了就把话说明白；
+///   ④ 防抖是可选档位，落在连接的 preferredVideoStabilizationMode 上。
 ///
-/// 现在麦克风走 MicTap（AVAudioEngine 的 inputNode），完全绕开相机管线：
-/// 相机崩了、降频了、被中断了，录音照走。成片一律靠备份 WAV 合成音轨，
-/// 走的是已有的 passthrough 补音链路，视频不重编码。
+/// MicTap 与备份 WAV 只留给 beauty：那条路的 writer 音轨仍然靠它兜。
 final class CameraRecorder: NSObject, ObservableObject {
 
     enum Mode: String {
@@ -41,8 +47,9 @@ final class CameraRecorder: NSObject, ObservableObject {
     private let audioOut = AVCaptureAudioDataOutput()
     private let writer = BeautyWriter()
 
-    /// 麦克风走独立引擎（AVAudioEngine），不挂在相机会话上。
-    /// 相机管线被热限流、被来电打断、被别的 App 抢走时，录音这条路还在。
+    /// 麦克风走独立引擎（AVAudioEngine），只在 beauty 路用。
+    /// native 把麦克风挂在相机会话上（系统相机同款），绝不起这个引擎 ——
+    /// 两路同时占一个麦，长录时最容易互相踩。
     private let mic = MicTap()
 
     private var videoIn: AVCaptureDeviceInput?
@@ -60,6 +67,8 @@ final class CameraRecorder: NSObject, ObservableObject {
     private var needRotate = false
     /// 前置录制是否镜像。默认开：取景框是镜面，成片也镜面，两边才对得上
     private var mirrorSaveFlag = true
+    /// 防抖档位（0 关 / 1 标准 / 2 电影级）。用户意图，实际生效的档位会降级后发到 stabilText
+    private var stabilizationFlag = 1
 
     // 只在 videoQ 上读写
     private var recordingFlag = false
@@ -99,6 +108,12 @@ final class CameraRecorder: NSObject, ObservableObject {
     /// 录制中盯着麦克风：太久没收到音频就把音频环境重新激活一次
     private var audioWatch: DispatchSourceTimer?
 
+    /// native 录制期间盯音频的定时器。故意和 audioWatch 分开：
+    /// 那条是 beauty 的「重开独立引擎」，这条只做「重新激活音频路由」，
+    /// 绝不碰 session —— startRunning/stopRunning 会把正在写的这一段提前收尾。
+    private var nativeWatch: DispatchSourceTimer?
+    private var watchOn = false
+
     /// 开录时刻的 hostTime。音频时间轴以它为 0 点，和视频 PTS 对齐。
     private var audioStartHost: UInt64 = 0
     /// 独立引擎起不来（被别的 App 长期占着麦之类），退回相机自带的那条音频路
@@ -129,6 +144,8 @@ final class CameraRecorder: NSObject, ObservableObject {
     @Published private(set) var presetText = "—"
     /// 实际分辨率，比如 "3840×2160"
     @Published private(set) var detailText = ""
+    /// 实际生效的防抖描述，比如 "防抖·标准"。关掉时是空串（拍摄页不显示）
+    @Published private(set) var stabilText = ""
     @Published private(set) var isFront = true
     @Published private(set) var mode: Mode = .native
     @Published private(set) var recordingError = ""
@@ -161,9 +178,14 @@ final class CameraRecorder: NSObject, ObservableObject {
             if self.session.inputs.isEmpty {
                 self.configure(front: front)
             }
-            // 以前这里会趁会话没跑起来先补一路麦克风输入。
-            // 现在音频走独立引擎（MicTap），相机会话里再挂麦克风反而会和它抢，
-            // 所以这里一个字都不加 —— 真起不来时由 fallbackToSessionAudio() 兜。
+            // 会话跑起来之前把麦克风挂好（configure 里做的）：native 的 movieOut
+            // 只有 session 里存在音频输入时才会写音轨。auth 刚给下来那一下
+            // AVCaptureDeviceInput 可能还建不起来，所以这里再补一次。
+            if self.modeFlag == .native, self.audioIn == nil {
+                self.session.beginConfiguration()
+                _ = self.addAudioInput()
+                self.session.commitConfiguration()
+            }
             if !self.session.isRunning {
                 self.session.startRunning()
             }
@@ -216,6 +238,7 @@ final class CameraRecorder: NSObject, ObservableObject {
         // 异常路径下 endAudioBackup 可能没跑到，这里兜一次，别让引擎一直占着麦
         mic.onBuffer = nil
         mic.stop()
+        stopNativeWatch()
         cfgQ.async {
             if self.session.isRunning {
                 self.session.stopRunning()
@@ -258,6 +281,98 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - 防抖
+
+    /// 防抖档位。设置页改这里，真正生效的档位发回 stabilText（拍摄页那个小胶囊）。
+    /// 档位切换只在没录的时候做：录制中改连接属性会闪一下，还可能被系统直接忽略。
+    func setStabilization(_ level: Int) {
+        cfgQ.async {
+            self.stabilizationFlag = level
+            guard !self.movieOut.isRecording else { return }
+            // 会话跑着的时候改连接属性，包一层 begin/commit 才是安全姿势
+            let wrap = self.session.isRunning
+            if wrap { self.session.beginConfiguration() }
+            self.applyStabilization()
+            if wrap { self.session.commitConfiguration() }
+        }
+    }
+
+    /// 把档位落到所有视频连接（movieOut 与 videoOut 各一条）。
+    ///
+    /// 用户选的是「意图」，实际支持什么由机型和当前画质决定 —— 4K60 上电影级基本都没戏，
+    /// 所以这里逐档降级，并把最终生效的那一档告诉界面，而不是让用户以为开了。
+    /// 调用方要么在 begin/commit 里（configureOutputs / setMode / updateFormat），
+    /// 要么自己包一层（setStabilization），这里不再套。
+    private func applyStabilization() {
+        let want = Stabilization(rawValue: stabilizationFlag) ?? .off
+        // 具体到「电影级这一档支不支持」只有设备格式知道，连接只能回答「整体能不能防抖」
+        let format = videoIn?.device.activeFormat
+        var anyConnection = false
+        var actual: AVCaptureVideoStabilizationMode = .off
+
+        let outs: [AVCaptureOutput] = [movieOut, videoOut]
+        for o in outs {
+            guard let c = o.connection(with: .video) else { continue }
+            guard c.isVideoStabilizationSupported else { continue }
+            anyConnection = true
+            actual = applyStabilization(to: c, want: want, format: format)
+        }
+
+        guard anyConnection else {
+            DispatchQueue.main.async { self.stabilText = "" }
+            return
+        }
+
+        let level = Self.level(of: actual)
+        DispatchQueue.main.async {
+            // 关掉就不占地方；开着才在拍摄页挂一个「防抖·标准」的小胶囊
+            self.stabilText = level == .off ? "" : "防抖·\(level.title)"
+        }
+        if level != want {
+            Diag.note("防抖：想要\(want.title)，这个画质只给到\(level.title)")
+        }
+    }
+
+    /// 单条连接的降级链。返回真正落地的模式。
+    ///
+    /// 注意：`isVideoStabilizationModeSupported(_:)` 在 **AVCaptureDevice.Format** 上，
+    /// 不在 AVCaptureConnection 上 —— 连接只有 `isVideoStabilizationSupported`（整体支不支持）。
+    private func applyStabilization(to c: AVCaptureConnection,
+                                    want: Stabilization,
+                                    format: AVCaptureDevice.Format?) -> AVCaptureVideoStabilizationMode {
+        // 拿不到格式（还没配上）就不做判断，直接照意图设：系统不支持的话
+        // 会自己把 activeVideoStabilizationMode 置成 off，不会抛异常。
+        func supported(_ m: AVCaptureVideoStabilizationMode) -> Bool {
+            guard m != .off else { return true }
+            guard let f = format else { return true }
+            return f.isVideoStabilizationModeSupported(m)
+        }
+
+        let chain: [AVCaptureVideoStabilizationMode]
+        switch want {
+        // 电影级先试增强版（iOS 13+ 更稳），不支持再退普通电影级、标准、关
+        case .cinematic: chain = [.cinematicExtended, .cinematic, .standard, .off]
+        case .standard:  chain = [.standard, .off]
+        case .off:       chain = [.off]
+        }
+        for mode in chain where supported(mode) {
+            if c.preferredVideoStabilizationMode != mode {
+                c.preferredVideoStabilizationMode = mode
+            }
+            return mode
+        }
+        return c.preferredVideoStabilizationMode
+    }
+
+    /// 系统返回的模式 → 界面上的三档
+    private static func level(of mode: AVCaptureVideoStabilizationMode) -> Stabilization {
+        switch mode {
+        case .standard: return .standard
+        case .cinematic, .cinematicExtended: return .cinematic
+        default: return .off
+        }
+    }
+
     /// 切原相机 / 美颜。会重配输出，画面会闪一下，所以只在没录的时候调。
     func setMode(_ m: Mode) {
         cfgQ.async {
@@ -265,9 +380,13 @@ final class CameraRecorder: NSObject, ObservableObject {
             guard !self.movieOut.isRecording else { return }
             self.modeFlag = m
             self.session.beginConfiguration()
+            self.syncAudioInputForMode()
             self.configureOutputs()
             if let dev = self.videoIn?.device {
                 self.applyFormat(dev)
+                // 刚换了格式（美颜 1080P ↔ 原相机 4K），支持的防抖档位也可能跟着变，
+                // configureOutputs 里那次是按旧格式算的，这里要再落一次
+                self.applyStabilization()
             }
             self.session.commitConfiguration()
             self.videoQ.async {
@@ -290,6 +409,8 @@ final class CameraRecorder: NSObject, ObservableObject {
             guard !self.movieOut.isRecording, let dev = self.videoIn?.device else { return }
             self.session.beginConfiguration()
             self.applyFormat(dev)
+            // 换了分辨率/帧率，防抖支持情况会变（4K60 常常只支持到标准），要重新落一次
+            self.applyStabilization()
             self.session.commitConfiguration()
             self.publishActual(dev, front: self.frontFlag)
         }
@@ -301,40 +422,92 @@ final class CameraRecorder: NSObject, ObservableObject {
 
     private var observingSession = false
 
-    /// 来电、别的 App 抢麦、切后台回来，都会让会话中断一次 —— 中断期间音频这条路
-    /// 直接停掉，画面照走。以前这种断流只能等看门狗每 1.5 秒摸一次，摸不回来就整段哑。
-    /// 现在把系统的中断/错误通知接上：停下来的时候把会话重新拉起来，下一段就正常。
+    /// 来电、别的 App 抢麦、切后台回来、机身过热限流，都会让会话中断一次 ——
+    /// 中断期间音频和画面一起停。以前这种断流只能等看门狗摸回来，摸不回来整段就废了。
+    ///
+    /// v1.22 起走系统相机那套恢复路径：
+    ///   · 中断结束 → 会话没在跑就拉起来，正在录就 resumeRecording，把剩下的接着写进同一个文件；
+    ///   · 运行时错误 → 同样重启一次，救不回来就把错误写到 recordingError 上。
+    /// 不再靠「备份 WAV 事后补音」来掩盖中断 —— 那条路才是用户说的「存半天」。
     private func observeSessionIfNeeded() {
         guard !observingSession else { return }
         observingSession = true
         let c = NotificationCenter.default
+
         c.addObserver(forName: .AVCaptureSessionWasInterrupted,
-                      object: session, queue: nil) { _ in
-            Diag.note("相机会话被中断（录音会停，这一段靠备份兜）")
+                      object: session, queue: nil) { [weak self] note in
+            guard let self else { return }
+            let raw = (note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int) ?? -1
+            Diag.note("相机会话被中断（\(Self.interruptText(raw))）"
+                      + (self.movieOut.isRecording ? "，录制中" : ""))
+            // 这里什么都不动：中断期间 session 是系统的，硬重启只会把正在写的这段打断。
+            // 真正的恢复放在 interruptionEnded 里做。
+            DispatchQueue.main.async {
+                if self.movieOut.isRecording {
+                    self.recordingError = "被系统打断了（\(Self.interruptText(raw))），会自动接着录"
+                }
+            }
         }
+
         c.addObserver(forName: .AVCaptureSessionInterruptionEnded,
                       object: session, queue: nil) { [weak self] _ in
             guard let self else { return }
-            Diag.note("相机会话中断结束")
-            self.cfgQ.async {
-                // 录制中不动 session：startRunning 会把当前这段录制提前收尾，
-                // 四分钟的片子就废了。等停下再重启，下一段自然正常。
-                if !self.session.isRunning, !self.movieOut.isRecording {
-                    self.session.startRunning()
-                }
-                AudioSession.enforceForCamera()
-            }
+            Diag.note("相机会话中断结束，尝试接着录")
+            self.recoverSession(reason: "")
         }
+
         c.addObserver(forName: .AVCaptureSessionRuntimeError,
                       object: session, queue: nil) { [weak self] note in
             guard let self else { return }
-            let code = (note.userInfo?[AVCaptureSessionErrorKey] as? NSError)?.code ?? 0
-            Diag.note("相机会话运行时错误 code=\(code)")
-            self.cfgQ.async {
-                if !self.movieOut.isRecording, !self.session.isRunning {
-                    self.session.startRunning()
+            let err = note.userInfo?[AVCaptureSessionErrorKey] as? NSError
+            let code = err?.code ?? 0
+            Diag.note("相机会话运行时错误 code=\(code) \(err?.localizedDescription ?? "")")
+            self.recoverSession(reason: "录制被系统中断")
+        }
+    }
+
+    /// 中断原因的文字版。只用于诊断日志和提示，看不懂的码原样带出来。
+    private static func interruptText(_ raw: Int) -> String {
+        guard let r = AVCaptureSession.InterruptionReason(rawValue: raw) else {
+            return "原因未知(\(raw))"
+        }
+        switch r {
+        case .videoDeviceNotAvailableInBackground: return "在后台"
+        case .audioDeviceInUseByAnotherClient: return "麦克风被别的 App 占了"
+        case .videoDeviceInUseByAnotherClient: return "摄像头被别的 App 占了"
+        case .videoDeviceNotAvailableWithMultipleForegroundApps: return "分屏"
+        case .videoDeviceNotAvailableDueToSystemPressure: return "机身过热限流"
+        default: return "原因未知(\(raw))"
+        }
+    }
+
+    /// 中断/错误之后的重启。**唯一**允许在录制中碰 session 的地方，必须小心：
+    ///   · 先让 session 跑起来（它没在跑，resumeRecording 没有任何意义）；
+    ///   · 再把暂停的这段接着写下去，否则中断那一刻之后的画面全丢；
+    ///   · 全都失败就把话说清楚，不要让用户以为录上了。
+    private func recoverSession(reason: String) {
+        cfgQ.async {
+            let wasRecording = self.movieOut.isRecording
+            if !self.session.isRunning {
+                self.session.startRunning()
+            }
+            if wasRecording, self.session.isRunning, self.movieOut.isRecording {
+                // 中断期间系统把这一段的写入暂停了（delegate 的 didPause 会来一下），
+                // 接着写在同一个文件里，用户拿到的还是一条完整视频。
+                self.movieOut.resumeRecording()
+            }
+            AudioSession.enforceForCamera()
+
+            let running = self.session.isRunning
+            let stillRecording = self.movieOut.isRecording
+            Diag.note("会话恢复：running=\(running ? 1 : 0) recording=\(stillRecording ? 1 : 0)")
+            guard !running else { return }
+            DispatchQueue.main.async {
+                if !reason.isEmpty {
+                    self.recordingError = "\(reason)，这一段可能不完整"
+                } else if self.recording {
+                    self.recordingError = "相机没恢复过来，这一段可能不完整"
                 }
-                AudioSession.enforceForCamera()
             }
         }
     }
@@ -369,9 +542,13 @@ final class CameraRecorder: NSObject, ObservableObject {
             return
         }
 
-        // 音频不挂在相机会话上：MicTap 用 AVAudioEngine 单独采。
-        // 以前 addAudioInput() 挂在这里，等于让音频和视频共用一条命，
-        // 长录时机身一热、相机管线一降频，音频连接先断，补都补不回来。
+        // native 把麦克风挂回相机会话，和系统相机一个做法：音频 input 与 video input
+        // 一起进 session，AVCaptureMovieFileOutput 才会把声音写进同一个 mp4 ——
+        // 停录即可用，不用事后拿备份 WAV 合成（那一步就是「存半天」）。
+        // beauty 故意不挂：它走 writer，音轨由 audioOut/MicTap 喂，链路保持原样。
+        if modeFlag == .native, !addAudioInput() {
+            Diag.note("音频输入没挂上（授权可能刚给下来），开录前会再试一次")
+        }
 
         applyFormat(dev)
         configureOutputs()
@@ -380,19 +557,50 @@ final class CameraRecorder: NSObject, ObservableObject {
 
     /// 加麦克风输入。首次授权那一刻音频设备常常还没就绪，`AVCaptureDeviceInput` 会直接抛错；
     /// 老代码用 `try?` 吞掉就再也没重试过，整场相机会话都是哑的 —— 这就是「第一条视频没声音」。
+    ///
+    /// v1.22 起 native 全程依赖这一路（movieOut 写音轨 + audioOut 喂识别），
+    /// 所以调用点有三处：configure()、start() 的开跑前补挂、开录前再确认一次。
     @discardableResult
     private func addAudioInput() -> Bool {
         if audioIn != nil { return true }
-        guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else { return false }
-        guard let mic = AVCaptureDevice.default(for: .audio) else { return false }
+        guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
+            Diag.note("音频输入：没有麦克风权限")
+            return false
+        }
+        guard let mic = AVCaptureDevice.default(for: .audio) else {
+            Diag.note("音频输入：拿不到麦克风设备")
+            return false
+        }
         do {
             let ai = try AVCaptureDeviceInput(device: mic)
-            guard session.canAddInput(ai) else { return false }
+            guard session.canAddInput(ai) else {
+                Diag.note("音频输入：session 装不下（可能已经在配了）")
+                return false
+            }
             session.addInput(ai)
             audioIn = ai
+            Diag.note("音频输入：已挂进相机会话（movieOut 会一起写音轨）")
             return true
         } catch {
+            Diag.note("音频输入：建不起来 \(error.localizedDescription)")
             return false
+        }
+    }
+
+    /// 切模式时同步音频输入。
+    ///
+    /// native 要它（movieOut 写音轨 + audioOut 喂识别）；beauty 千万不能留 ——
+    /// beauty 的备份 WAV 由 MicTap 写，session 的 audioOut 再往同一个文件里追加一遍，
+    /// 备份就成了一段两路交错的噪声，事后补音直接毁片子。所以切到 beauty 时主动摘掉。
+    private func syncAudioInputForMode() {
+        if modeFlag == .native {
+            _ = addAudioInput()
+        } else if let ai = audioIn, !micFailed {
+            // 只在独立引擎健康时才摘：如果当初正是因为引擎起不来才把麦克风挂回会话的
+            // （fallbackToSessionAudio），摘掉等于把这条仅有的音频路断了。
+            session.removeInput(ai)
+            audioIn = nil
+            Diag.note("切到美颜：音频输入已从相机会话摘掉（麦克风交给 MicTap）")
         }
     }
 
@@ -426,13 +634,23 @@ final class CameraRecorder: NSObject, ObservableObject {
             }
         }
 
+        // 音频数据输出两路都用：beauty 走它拿 PCM 喂 writer / 备份；
+        // native 走它把同一路音频喂给跟读识别（onAudio），录制则由 movieOut 自己写。
+        //
+        // 同一个音频输入同时接 movieOut 和 audioOut：iOS 16 之前系统只允许一条连接活着
+        // （而且是「movieOut 赢、audioOut 被停用」），16 起这个限制取消了。
+        // 本工程 deployment target 是 16.0，所以两条可以同时有效 —— 万一哪天要降到 15，
+        // 这里就会退化成「能录但跟读没声音」，届时必须改回别的时间轴。
         audioOut.setSampleBufferDelegate(self, queue: audioQ)
         if session.canAddOutput(audioOut) {
             session.addOutput(audioOut)
+        } else if modeFlag == .native {
+            Diag.note("音频输出没加进 session：这条能录，但跟读可能没反应")
         }
 
-        // 输出刚加完，连接才存在，镜像要在这时候设
+        // 输出刚加完，连接才存在，镜像和防抖都要在这时候设
         applyMirror()
+        applyStabilization()
     }
 
     private func applyFormat(_ dev: AVCaptureDevice) {
@@ -537,7 +755,18 @@ final class CameraRecorder: NSObject, ObservableObject {
     func startRecording(to url: URL) {
         audioFrameCount = 0
 
-        // 独立引擎是「开录才启动」的，之前当然没有音频帧，不用在这儿等。
+        if modeFlag == .native {
+            // 原相机这条路，声音完全靠 session 里的音频输入。
+            // 授权刚给下来那一下 AVCaptureDeviceInput 可能建不起来，所以开录前再确认一次：
+            // 这一次没挂上，整条片子就是哑的，而哑片子事后只能靠合成去救 —— 正是要摆脱的东西。
+            ensureSessionAudio { ok in
+                if !ok { Diag.note("开录前麦克风输入仍然没挂上，这条可能没有声音") }
+                self.beginRecordingNow(url)
+            }
+            return
+        }
+
+        // 美颜：独立引擎是「开录才启动」的，之前当然没有音频帧，不用在这儿等。
         // 只有退回相机自带音频的那条路，才需要在开录前先摸一下路由通不通。
         if micFailed {
             let age = CACurrentMediaTime() - lastAudioFrameAt
@@ -553,6 +782,21 @@ final class CameraRecorder: NSObject, ObservableObject {
         beginRecordingNow(url)
     }
 
+    /// 确认 session 里挂着麦克风输入。已经在就立刻回调，不在就补一次。
+    /// 补完不用在这儿重设镜像/防抖：beginNativeRecording 开录前会整条重设一遍。
+    private func ensureSessionAudio(_ done: @escaping (Bool) -> Void) {
+        cfgQ.async {
+            if self.audioIn != nil {
+                DispatchQueue.main.async { done(true) }
+                return
+            }
+            self.session.beginConfiguration()
+            let ok = self.addAudioInput()
+            self.session.commitConfiguration()
+            DispatchQueue.main.async { done(ok) }
+        }
+    }
+
     private func beginRecordingNow(_ url: URL) {
         // 上一次收尾可能因为异常没走到 deliver，这里把状态清干净，
         // 否则新的一条一开录就会被「等整理完再停会话」卡住
@@ -565,7 +809,6 @@ final class CameraRecorder: NSObject, ObservableObject {
         // 就能把 AVAudioEngine 踹停，顺序反了等于白开
         AudioSession.keepAlive()
         audioStartHost = mach_absolute_time()
-        beginAudioBackup()
 
         // 开录后一秒半还是没有音频帧：基本就是麦克风这条路断了，先把话说在前面。
         // 不去打断录制（画面还在录，说不定后面恢复），只把提示留下。
@@ -577,11 +820,12 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
 
         if modeFlag == .native {
-            // 声音由独立引擎负责，相机只管画面。micOK 表示引擎起没起来；
-            // 起不来说明这一条要走回退路径（相机自带音频），下面 beginAudioBackup 已经判过了。
-            beginNativeRecording(url: url, micOK: !micFailed)
+            // 系统相机同款：音视频由 movieOut 一起写，不起 MicTap、不写备份 WAV。
+            beginNativeRecording(url: url)
             return
         }
+
+        beginAudioBackup()
 
         videoQ.async {
             self.pendingURL = url
@@ -594,7 +838,7 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
     }
 
-    private func beginNativeRecording(url: URL, micOK: Bool) {
+    private func beginNativeRecording(url: URL) {
         cfgQ.async {
             guard self.movieOut.isRecording == false else { return }
             if !self.session.isRunning {
@@ -604,8 +848,9 @@ final class CameraRecorder: NSObject, ObservableObject {
             if let c = self.movieOut.connection(with: .video), c.isVideoOrientationSupported {
                 c.videoOrientation = .portrait
             }
-            // 录制开始前再确认一次镜像，避免切镜头后连接被重建
+            // 录制开始前再确认一次镜像和防抖：切镜头会重建连接，这两样都挂在连接上
             self.applyMirror()
+            self.applyStabilization()
 
             // 没有可用的视频连接时 startRecording 会直接抛 Objective-C 异常（闪退），先确认再开
             guard let vc = self.movieOut.connection(with: .video), vc.isEnabled else {
@@ -616,12 +861,70 @@ final class CameraRecorder: NSObject, ObservableObject {
                 return
             }
 
+            // 音频连接在不在，决定了这条片子有没有声音
+            let micOK: Bool
+            if let ac = self.movieOut.connection(with: .audio) {
+                micOK = ac.isEnabled && self.audioIn != nil
+            } else {
+                micOK = false
+            }
+
             try? FileManager.default.removeItem(at: url)
             DispatchQueue.main.async {
                 self.recordingError = micOK ? "" : "麦克风没接上，这条可能没有声音"
                 self.recording = true
             }
+            self.startNativeWatch()
             self.movieOut.startRecording(to: url, recordingDelegate: self)
+        }
+    }
+
+    /// 开录时把上一次 beauty 留下的备份清干净，并开始盯音频。
+    ///
+    /// 为什么要清：native 根本不写备份，可「音轨校验」那条兜底会去读 backupURL ——
+    /// 上一次美颜录制的旧 WAV 要是还在，就可能把上一段的声音合成到这条片子上。
+    private func startNativeWatch() {
+        audioQ.async {
+            self.backupOn = false
+            // 先把可能还开着的句柄关掉（上一次 beauty 被中断时留下的），再清地址和计数
+            self.closeBackupFile()
+            self.backupURL = nil
+            self.backupFrames = 0
+
+            self.watchOn = true
+            self.audioWarned = false
+            self.audioNextRetry = 0
+            // 用「现在」当基准，别拿上一次录制留下的旧时间戳算断流
+            self.lastAudioFrameAt = CACurrentMediaTime()
+
+            self.nativeWatch?.cancel()
+            let t = DispatchSource.makeTimerSource(queue: self.audioQ)
+            t.schedule(deadline: .now() + 1.2, repeating: 0.5)
+            t.setEventHandler { [weak self] in
+                guard let self, self.watchOn else { return }
+                let now = CACurrentMediaTime()
+                let gap = now - self.lastAudioFrameAt
+                // 最多每 2 秒抢一次：反复 setCategory 本身就会打断采集
+                guard gap > 1.2, now >= self.audioNextRetry else { return }
+                self.audioNextRetry = now + 2.0
+                // 只重新激活音频路由，绝不动 session —— 一停就把这段录制收尾了
+                let changed = AudioSession.enforceForCamera()
+                if !self.audioWarned {
+                    self.audioWarned = true
+                    Diag.note(String(format: "原相机录音断流 %.1fs，已重新激活音频路由%@",
+                                     gap, changed ? "（换了类别）" : ""))
+                }
+            }
+            self.nativeWatch = t
+            t.resume()
+        }
+    }
+
+    private func stopNativeWatch() {
+        audioQ.async {
+            self.watchOn = false
+            self.nativeWatch?.cancel()
+            self.nativeWatch = nil
         }
     }
 
@@ -634,6 +937,7 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
 
         if modeFlag == .native {
+            stopNativeWatch()
             cfgQ.async {
                 if self.movieOut.isRecording {
                     self.movieOut.stopRecording()
@@ -1095,6 +1399,40 @@ final class CameraRecorder: NSObject, ObservableObject {
         backupFrames += frames
     }
 
+    // MARK: - 原相机停录后的自检
+
+    /// native 停录后只做一件事：确认这条 mp4 里到底有没有音轨。
+    ///
+    /// 正常情况下 session 挂着麦克风、movieOut 把音视频一起写，这一步是「读一下文件头」
+    /// 级别的开销，**不做任何合成**，所以停录即可交付 —— 用户抱怨的「存半天」就是
+    /// 以前那条无条件补音链路。
+    ///
+    /// 万一音轨真的没写进去（极少见：音频连接恰好在这一条开始时没建起来），
+    /// 有备份就用备份合成，没有就把话说清楚，绝不静默交付一条哑片。
+    private func verifyNativeAudio(_ video: URL, done: @escaping (URL?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let asset = AVURLAsset(url: video)
+            let hasAudio = !asset.tracks(withMediaType: .audio).isEmpty
+            let len = asset.duration.seconds
+            Diag.note("原相机成片：\(String(format: "%.1f", len))s 音轨="
+                      + (hasAudio ? "有（直接交付，不合成）" : "无（走兜底）"))
+
+            guard !hasAudio else {
+                DispatchQueue.main.async { done(video) }
+                return
+            }
+
+            // 走到这里说明这一条确实是哑的，只能走老路：有备份就补，没备份就报清楚
+            DispatchQueue.main.async {
+                self.tidying = true
+                self.repairAudioIfNeeded(video) { url in
+                    self.tidying = false
+                    done(url)
+                }
+            }
+        }
+    }
+
     /// 用备份 PCM 当音轨，重新合成一条成片。
     ///
     /// ── v1.14：判据改成看「尾巴」 ─────────────────────────────
@@ -1487,6 +1825,8 @@ final class CameraRecorder: NSObject, ObservableObject {
             writer.append(audio: sb)
         }
 
+        // native 这一路只负责两件事：把格式/时间戳记下来，并把 PCM 交给跟读识别。
+        // 录制的音轨由 movieOut 自己从同一个音频输入写，这里不碰（backupOn 在 native 恒为 false）。
         if let pcm = CameraRecorder.toPCM(sb) {
             if backupOn {
                 appendAudioBackup(pcm, pts: CMSampleBufferGetPresentationTimeStamp(sb))
@@ -1542,6 +1882,10 @@ extension CameraRecorder: AVCaptureFileOutputRecordingDelegate {
             }
         }
         let finished = ok
+        // 这一条是走哪条路录的，得在回调时刻定下来：后面可能已经在切模式了
+        let wasNative = modeFlag == .native
+        if wasNative { stopNativeWatch() }
+
         DispatchQueue.main.async {
             self.recording = false
             if !msg.isEmpty { self.recordingError = msg }
@@ -1550,11 +1894,34 @@ extension CameraRecorder: AVCaptureFileOutputRecordingDelegate {
                 self.deliver(nil)
                 return
             }
-            // 万一这条路没把音轨写进文件，用录制期间备份的 PCM 补上，别让用户白录一条
+
+            if wasNative {
+                // 系统相机同款：音视频本来就在同一个文件里，确认音轨在就立刻交付。
+                self.verifyNativeAudio(outputFileURL) { url in
+                    self.deliver(url)
+                }
+                return
+            }
+
+            // 美颜这条路保持原样：writer 的音轨可能缺，靠备份 PCM 补
             self.repairAudioIfNeeded(outputFileURL) { url in
                 self.deliver(url)
             }
         }
+    }
+
+    /// 会话被中断时系统会把正在写的这段暂停一下。恢复由 recoverSession 做，
+    /// 这里只留记录，方便对着诊断日志看中断时间点。
+    func fileOutput(_ output: AVCaptureFileOutput,
+                    didPauseRecordingTo fileURL: URL,
+                    from connections: [AVCaptureConnection]) {
+        Diag.note("录制被暂停（相机会话中断）")
+    }
+
+    func fileOutput(_ output: AVCaptureFileOutput,
+                    didResumeRecordingTo fileURL: URL,
+                    from connections: [AVCaptureConnection]) {
+        Diag.note("录制已接着录")
     }
 }
 
