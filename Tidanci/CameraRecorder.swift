@@ -25,7 +25,7 @@ import ImageIO
 /// 所以现在：
 ///   ① native 的音频输入挂在 session 上，停录立刻交付带声音的 mp4，不再合成；
 ///   ② 跟读识别改由 session 里的 AVCaptureAudioDataOutput 喂 onAudio（native 不再有 MicTap）；
-///   ③ 会话中断 / 运行时错误由通知接管，能恢复就 resumeRecording 接着录，恢复不了就把话说明白；
+///   ③ 会话中断 / 运行时错误由通知接管，能恢复就把 session 拉起来接着录（iOS 18+ 再补 resumeRecording），恢复不了就把话说明白；
 ///   ④ 防抖是可选档位，落在连接的 preferredVideoStabilizationMode 上。
 ///
 /// MicTap 与备份 WAV 只留给 beauty：那条路的 writer 音轨仍然靠它兜。
@@ -426,7 +426,8 @@ final class CameraRecorder: NSObject, ObservableObject {
     /// 中断期间音频和画面一起停。以前这种断流只能等看门狗摸回来，摸不回来整段就废了。
     ///
     /// v1.22 起走系统相机那套恢复路径：
-    ///   · 中断结束 → 会话没在跑就拉起来，正在录就 resumeRecording，把剩下的接着写进同一个文件；
+    ///   · 中断结束 → 会话没在跑就拉起来，剩下的画面接着写进同一个文件
+    ///     （iOS 18 起才额外调 resumeRecording；16/17 上由 AVCaptureMovieFileOutput 自己续写）；
     ///   · 运行时错误 → 同样重启一次，救不回来就把错误写到 recordingError 上。
     /// 不再靠「备份 WAV 事后补音」来掩盖中断 —— 那条路才是用户说的「存半天」。
     private func observeSessionIfNeeded() {
@@ -482,8 +483,8 @@ final class CameraRecorder: NSObject, ObservableObject {
     }
 
     /// 中断/错误之后的重启。**唯一**允许在录制中碰 session 的地方，必须小心：
-    ///   · 先让 session 跑起来（它没在跑，resumeRecording 没有任何意义）；
-    ///   · 再把暂停的这段接着写下去，否则中断那一刻之后的画面全丢；
+    ///   · 先让 session 跑起来（它没在跑，谈「接着录」没有意义）；
+    ///   · 「续写」这一步是 iOS 18 才有的 API，18 以下只能靠 session.startRunning()；
     ///   · 全都失败就把话说清楚，不要让用户以为录上了。
     private func recoverSession(reason: String) {
         cfgQ.async {
@@ -491,9 +492,13 @@ final class CameraRecorder: NSObject, ObservableObject {
             if !self.session.isRunning {
                 self.session.startRunning()
             }
-            if wasRecording, self.session.isRunning, self.movieOut.isRecording {
-                // 中断期间系统把这一段的写入暂停了（delegate 的 didPause 会来一下），
-                // 接着写在同一个文件里，用户拿到的还是一条完整视频。
+            // resumeRecording() 是 iOS 18 才加的（配套「手动暂停/继续」那套 UI），部署目标是 16，
+            // 所以这里必须带可用性判断。iOS 16/17 上不用我们手动续写：
+            // 来电/被抢占这类系统中断，AVCaptureMovieFileOutput 自己在中断恢复后会继续往
+            // 同一个文件里写，我们只要把 session 拉起来就够了；硬加这行只会编译不过。
+            // 别以后又把它加回来 —— 18 以下的机型压根没有这个方法。
+            if #available(iOS 18.0, *),
+               wasRecording, self.session.isRunning, self.movieOut.isRecording {
                 self.movieOut.resumeRecording()
             }
             AudioSession.enforceForCamera()
