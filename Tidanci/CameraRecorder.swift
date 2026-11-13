@@ -268,6 +268,12 @@ final class CameraRecorder: NSObject, ObservableObject {
             AudioSession.release()
             DispatchQueue.main.async { self.ready = false }
         }
+        // 异常路径（开录失败、录制中断）下备份文件可能还开着，这里兜一次：
+        // 不收掉它会跟着预览一直写下去
+        audioQ.async {
+            self.backupOn = false
+            self.closeBackupFile()
+        }
     }
 
     func switchCamera() {
@@ -940,6 +946,9 @@ final class CameraRecorder: NSObject, ObservableObject {
                 self.finishing = false
                 self.recordingError = "开录失败，再点一次"
                 self.recording = false
+                // 开录没成功，但备份文件已经建好了：不收掉的话，界面上停着预览
+                // 也会一直往里面写音频（每秒 190KB），几分钟就白占几十兆。
+                self.endAudioBackup { _, _ in }
             }
         }
     }
