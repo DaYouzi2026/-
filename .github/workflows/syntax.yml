@@ -1,0 +1,30 @@
+name: swift-syntax
+
+# 只做语法解析，不需要 macOS SDK，ubuntu runner 秒级出结果。
+# 用来在 macOS 编译机排队时先抓语法/结构错误。
+on:
+  workflow_dispatch:
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: swift version
+        run: swift --version
+      - name: parse
+        run: |
+          set +e
+          mkdir -p /tmp/parse
+          fail=0
+          for f in Tidanci/*.swift; do
+            out=$(swiftc -parse "$f" 2>&1)
+            if [ -n "$out" ]; then
+              echo "=== $f ==="
+              echo "$out" | head -40
+              fail=1
+            fi
+          done
+          echo "PARSE_FAIL=$fail"
+          exit 0
