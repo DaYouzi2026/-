@@ -215,12 +215,22 @@ final class MovieWriter {
             armedURL = nil
             return false
         }
-        w.startSession(atSourceTime: pts)
+
+        // 时间轴起点取「第一帧视频」和「已缓存的第一帧音频」里更早的那个，
+        // 这样开头几十毫秒的声音不会因为视频晚到而被丢掉。
+        var startTime = pts
+        if let a = pending.first {
+            let ap = CMSampleBufferGetPresentationTimeStamp(a)
+            if ap.isValid, ap.isNumeric, CMTimeCompare(ap, startTime) < 0 {
+                startTime = ap
+            }
+        }
+        w.startSession(atSourceTime: startTime)
 
         writer = w
         videoIn = vi
         audioIn = ai
-        startAt = pts
+        startAt = startTime
 
         // 先到的音频补进去（只补时间不早于起始时间的）
         for a in pending {
