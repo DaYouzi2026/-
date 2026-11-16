@@ -1,26 +1,28 @@
 import SwiftUI
 import Foundation
 
-/// 设计令牌。浅色为主，拍摄页单独用暗色覆盖层。
+/// 设计令牌。「聚光灯」主题：暖白底、琥珀焦点、墨绿主按钮、大标题顶栏。
+/// 拍摄页单独用暗色覆盖层。
 enum T {
-    static let bg = Color(hex: 0xF3F4FA)
+    static let bg = Color(hex: 0xFBF8F2)          // 暖白背景
     static let surface = Color.white
-    static let surface2 = Color(hex: 0xF7F8FC)
-    static let accent = Color(hex: 0x6C5CE7)
-    static let accent2 = Color(hex: 0x4B7BFF)
-    static let ink = Color(hex: 0x15181F)
-    static let ink2 = Color(hex: 0x3F4557)
-    static let sub = Color(hex: 0x8A90A2)
-    static let line = Color(hex: 0xE7E9F2)
-    static let danger = Color(hex: 0xF0444B)
-    static let ok = Color(hex: 0x12B76A)
-    static let warn = Color(hex: 0xF79009)
+    static let surface2 = Color(hex: 0xF6F1E8)    // 暖白浅面
+    static let accent = Color(hex: 0xE0932E)      // 琥珀焦点色（收藏/选中/进度）
+    static let accent2 = Color(hex: 0x1F6B4F)     // 墨绿（自动滚动等次强调）
+    static let ink = Color(hex: 0x25201A)         // 暖墨色主文字
+    static let ink2 = Color(hex: 0x554C40)
+    static let sub = Color(hex: 0x9A8F7E)
+    static let line = Color(hex: 0xEAE2D5)
+    static let danger = Color(hex: 0xD9483B)
+    static let ok = Color(hex: 0x1F8A5B)
+    static let warn = Color(hex: 0xE0932E)
 
     /// 拍摄页浮层
     static let overlay = Color.black.opacity(0.52)
     static let overlaySoft = Color.black.opacity(0.32)
 
-    static let grad = LinearGradient(colors: [Color(hex: 0x6C5CE7), Color(hex: 0x4B7BFF)],
+    /// 顶栏/主按钮渐变：琥珀 → 暖橙，聚光灯感
+    static let grad = LinearGradient(colors: [Color(hex: 0xE8A33D), Color(hex: 0xD97B2C)],
                                      startPoint: .topLeading,
                                      endPoint: .bottomTrailing)
 
