@@ -45,19 +45,24 @@ struct HomeView: View {
     @EnvironmentObject var store: Store
 
     @State private var query = ""
+    @State private var activeCategory = "全部"
     @State private var editing: Script?
     @State private var running: Script?
     @State private var toast: String?
 
     private var list: [Script] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty else { return store.scripts }
-        return store.scripts.filter {
+        var base = store.scripts
+        if activeCategory != "全部" {
+            base = base.filter { $0.category == activeCategory }
+        }
+        guard !q.isEmpty else { return base }
+        return base.filter {
             $0.title.localizedCaseInsensitiveContains(q) || $0.content.localizedCaseInsensitiveContains(q)
         }
     }
 
-    private var totalChars: Int { store.scripts.reduce(0) { $0 + $1.charCount } }
+    private var totalChars: Int { list.reduce(0) { $0 + $1.charCount } }
 
     private var totalText: String {
         totalChars >= 10000
@@ -72,6 +77,7 @@ struct HomeView: View {
 
                 VStack(spacing: 0) {
                     header
+                    categoryBar
 
                     ScrollView {
                         VStack(spacing: 12) {
@@ -165,13 +171,44 @@ struct HomeView: View {
         )
     }
 
+    /// 横向可滑动的场景分类筛选栏
+    private var categoryBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(Script.categories, id: \.self) { c in
+                    let on = activeCategory == c
+                    Button {
+                        withAnimation(.easeOut(duration: 0.15)) { activeCategory = c }
+                    } label: {
+                        Text(c)
+                            .font(.system(size: 13, weight: on ? .semibold : .medium))
+                            .foregroundColor(on ? .white : T.ink2)
+                            .padding(.horizontal, 14)
+                            .frame(height: 32)
+                            .background(on ? T.accent : T.surface2)
+                            .clipShape(Capsule())
+                            .overlay(
+                                Capsule().stroke(on ? Color.clear : T.line, lineWidth: 1)
+                            )
+                    }
+                    .pressable()
+                    .accessibilityLabel("筛选 \(c)")
+                }
+            }
+            .padding(.horizontal, 16)
+        }
+        .padding(.vertical, 12)
+        .background(T.bg)
+    }
+
     // MARK: 卡片
 
     private func card(_ s: Script) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 11) {
                 RoundedRectangle(cornerRadius: 3, style: .continuous)
-                    .fill(T.tint(s.title.isEmpty ? s.id.uuidString : s.title))
+                    .fill(s.category.isEmpty ? T.tint(s.title.isEmpty ? s.id.uuidString : s.title)
+                                             : T.categoryColor(s.category))
                     .frame(width: 5, height: 40)
 
                 VStack(alignment: .leading, spacing: 5) {
@@ -190,6 +227,11 @@ struct HomeView: View {
             }
 
             HStack(spacing: 6) {
+                if !s.category.isEmpty {
+                    Tag(text: s.category,
+                        bg: T.categoryColor(s.category).opacity(0.13),
+                        fg: T.categoryColor(s.category))
+                }
                 Tag(text: "\(s.charCount) 字")
                 Tag(text: s.durationText)
                 Spacer(minLength: 4)

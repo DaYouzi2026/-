@@ -36,6 +36,12 @@ enum T {
         for u in seed.unicodeScalars { h = (h &* 33) &+ UInt64(u.value) }
         return Color(hue: Double(h % 360) / 360.0, saturation: 0.52, brightness: 0.92)
     }
+
+    /// 台本分类的专属色，没配到就回退到暖墨灰
+    static func categoryColor(_ name: String) -> Color {
+        guard let hex = Script.categoryPalette[name] else { return sub }
+        return Color(hex: hex)
+    }
 }
 
 extension Color {

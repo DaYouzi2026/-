@@ -7,6 +7,7 @@ struct ScriptEditorView: View {
 
     @State private var title: String
     @State private var content: String
+    @State private var category: String
     @FocusState private var focused: Bool
 
     private let id: UUID
@@ -15,6 +16,7 @@ struct ScriptEditorView: View {
         id = script.id
         _title = State(initialValue: script.title)
         _content = State(initialValue: script.content)
+        _category = State(initialValue: script.category)
     }
 
     private var chars: Int {
@@ -29,6 +31,7 @@ struct ScriptEditorView: View {
         NavigationStack {
             VStack(spacing: 12) {
                 titleField
+                categoryBar
                 editor
                 tools
             }
@@ -60,6 +63,39 @@ struct ScriptEditorView: View {
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
                     .stroke(T.line, lineWidth: 1)
             )
+    }
+
+    /// 场景分类选择：点选一个标签，再点一次取消（存成未分类）
+    private var categoryBar: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("场景分类")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(T.sub)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(Array(Script.categories.dropFirst()), id: \.self) { c in
+                        let on = category == c
+                        Button {
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                category = on ? "" : c
+                            }
+                        } label: {
+                            Text(c)
+                                .font(.system(size: 13, weight: on ? .semibold : .medium))
+                                .foregroundColor(on ? .white : T.ink2)
+                                .padding(.horizontal, 13)
+                                .frame(height: 30)
+                                .background(on ? T.categoryColor(c) : T.surface)
+                                .clipShape(Capsule())
+                                .overlay(
+                                    Capsule().stroke(on ? Color.clear : T.line, lineWidth: 1)
+                                )
+                        }
+                        .pressable()
+                    }
+                }
+            }
+        }
     }
 
     private var editor: some View {
@@ -149,7 +185,7 @@ struct ScriptEditorView: View {
     }
 
     private func save() {
-        store.upsert(Script(id: id, title: title, content: content))
+        store.upsert(Script(id: id, title: title, content: content, category: category))
         dismiss()
     }
 }
