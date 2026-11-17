@@ -279,7 +279,6 @@ final class Store: ObservableObject {
     static let samples: [Script] = [
         // ── 开场留人 ──────────────────────────────
         Script(title: "先别划走，这三点能帮你省半年",
-               category: "开场留人",
                content: """
                先别划走。
 
@@ -290,10 +289,10 @@ final class Store: ObservableObject {
                看完你会明白，为什么你之前一直没效果。
 
                我们开始。
-               """),
+               """,
+               category: "开场留人"),
 
         Script(title: "如果你也经常感到累，这条是给你看的",
-               category: "开场留人",
                content: """
                如果你也经常觉得累，不是身体累，是那种心里提不起劲的累。
 
@@ -304,10 +303,10 @@ final class Store: ObservableObject {
                这不怪你。
 
                往下看，我告诉你为什么。
-               """),
+               """,
+               category: "开场留人"),
 
         Script(title: "大多数人都做反了",
-               category: "开场留人",
                content: """
                这件事，大多数人都做反了。
 
@@ -318,10 +317,10 @@ final class Store: ObservableObject {
                后来才发现，方向错了，越努力偏得越远。
 
                今天我用三分钟，把这个坑给你讲清楚。
-               """),
+               """,
+               category: "开场留人"),
 
         Script(title: "一个反问开场",
-               category: "开场留人",
                content: """
                我问你一个问题。
 
@@ -334,11 +333,11 @@ final class Store: ObservableObject {
                而是一个很久没联系的人，或者一件一直没做的事。
 
                这就是今天想聊的。
-               """),
+               """,
+               category: "开场留人"),
 
         // ── 干货科普 ──────────────────────────────
         Script(title: "为什么明明睡够了，还是很累",
-               category: "干货科普",
                content: """
                你有没有过这种时候，明明睡了八个小时，醒来还是累？
 
@@ -351,10 +350,10 @@ final class Store: ObservableObject {
                试试把睡眠时间调到九十分钟的整数倍，比如七个半小时。
 
                闹钟不是看几点，是看睡了几个周期。今晚就可以试。
-               """),
+               """,
+               category: "干货科普"),
 
         Script(title: "三个提升专注力的方法",
-               category: "干货科普",
                content: """
                很多人说自己专注力差，其实是方法不对。分享三个我一直在用的。
 
@@ -371,10 +370,10 @@ final class Store: ObservableObject {
                比如写完第三段，而不是写稿子。越具体越好。
 
                这三个不需要意志力，试试就知道。
-               """),
+               """,
+               category: "干货科普"),
 
         Script(title: "收藏了几百条，为什么还是没变",
-               category: "干货科普",
                content: """
                你收藏夹里是不是躺着几百条有用的内容，一条都没真正用过？
 
@@ -389,10 +388,10 @@ final class Store: ObservableObject {
                知识不是收藏进来的，是用出来的。
 
                从今天起，收藏之前先问自己：这条，我今天能用吗？
-               """),
+               """,
+               category: "干货科普"),
 
         Script(title: "十分钟法则，治拖延",
-               category: "干货科普",
                content: """
                拖延的时候，我们总想着要把整件事做完，所以迟迟不敢开始。
 
@@ -407,11 +406,11 @@ final class Store: ObservableObject {
                就算真的只做了十分钟，也比盯着它焦虑一整天强。
 
                今天那件一直拖着的事，现在就做十分钟。
-               """),
+               """,
+               category: "干货科普"),
 
         // ── 情感共鸣 ──────────────────────────────
         Script(title: "如果你现在很焦虑，先别急着解决",
-               category: "情感共鸣",
                content: """
                如果你现在很焦虑，先别急着解决。
 
@@ -426,10 +425,10 @@ final class Store: ObservableObject {
                你不需要今天就把人生想清楚，你只需要把眼前这一步走稳。
 
                慢慢来，真的来得及。
-               """),
+               """,
+               category: "情感共鸣"),
 
         Script(title: "致还在熬的那个人",
-               category: "情感共鸣",
                content: """
                如果你正处在最难的那段时间，我想跟你说几句实在话。
 
@@ -444,10 +443,10 @@ final class Store: ObservableObject {
                再撑一撑。
 
                会好的，虽然慢，但会。
-               """),
+               """,
+               category: "情感共鸣"),
 
         Script(title: "关于慢慢来",
-               category: "情感共鸣",
                content: """
                我们总怕自己慢。
 
@@ -462,11 +461,11 @@ final class Store: ObservableObject {
                你只管按时浇水、晒太阳，剩下的交给时间。
 
                别慌，你有你的节奏。
-               """),
+               """,
+               category: "情感共鸣"),
 
         // ── 种草带货 ──────────────────────────────
         Script(title: "每天靠咖啡续命的，可以试试这个",
-               category: "种草带货",
                content: """
                如果你每天靠咖啡续命，但又不满意速溶的味道，可以试试这个。
 
@@ -479,10 +478,10 @@ final class Store: ObservableObject {
                关键是体积小，出差、通勤都能带。
 
                下面链接有试吃装，想试的可以看看。
-               """),
+               """,
+               category: "种草带货"),
 
         Script(title: "判断一个东西值不值，看这三点",
-               category: "种草带货",
                content: """
                买东西前，我一般会问自己三个问题，能帮你少花很多冤枉钱。
 
@@ -499,10 +498,10 @@ final class Store: ObservableObject {
                花两分钟对比一下，往往能省不少。
 
                冲动消费的本质，是没给自己留两分钟的冷静时间。
-               """),
+               """,
+               category: "种草带货"),
 
         Script(title: "直播间开场，先把人留住",
-               category: "种草带货",
                content: """
                欢迎刚进来的朋友，先别急着走。
 
@@ -515,11 +514,11 @@ final class Store: ObservableObject {
                第三，评论区会抽三位送同款。
 
                想要哪个，扣在公屏上，我按你们说得最多的先讲。
-               """),
+               """,
+               category: "种草带货"),
 
         // ── 生活记录 ──────────────────────────────
         Script(title: "没什么计划的周末，也挺好",
-               category: "生活记录",
                content: """
                早上七点半，没设闹钟，自然醒。
 
@@ -534,10 +533,10 @@ final class Store: ObservableObject {
                下午看了半本书，睡着了两次。晚上出门走了走，风很舒服。
 
                这一天什么都没干，但我觉得很值。
-               """),
+               """,
+               category: "生活记录"),
 
         Script(title: "这周做了三件事，汇报一下",
-               category: "生活记录",
                content: """
                这周做了三件事，汇报一下。
 
@@ -552,10 +551,10 @@ final class Store: ObservableObject {
                虽然只看了半本，但睡眠深了很多。
 
                下周继续。改变不用大，能坚持就行。
-               """),
+               """,
+               category: "生活记录"),
 
         Script(title: "早起三十天，我发现了什么",
-               category: "生活记录",
                content: """
                早起三十天，说点真实的感受。
 
@@ -570,11 +569,11 @@ final class Store: ObservableObject {
                当然也有没做到的时候，周末照样睡到中午。
 
                没关系，能连着做到，就已经比从前强了。
-               """),
+               """,
+               category: "生活记录"),
 
         // ── 结尾引导 ──────────────────────────────
         Script(title: "看到这里，说明对你有点用",
-               category: "结尾引导",
                content: """
                看到这里，说明这条视频对你多少有点用。
 
@@ -585,10 +584,10 @@ final class Store: ObservableObject {
                这个号会持续更新，都是我自己真正在用的方法，不跳舞、不蹭热点。
 
                想看什么，关注之后慢慢翻。
-               """),
+               """,
+               category: "结尾引导"),
 
         Script(title: "最后说一句",
-               category: "结尾引导",
                content: """
                最后说一句。
 
@@ -601,10 +600,10 @@ final class Store: ObservableObject {
                如果这条帮到了你，点个赞或者留句话，让我知道有人在看。
 
                我们下一条见。
-               """),
+               """,
+               category: "结尾引导"),
 
         Script(title: "把这句话送给你",
-               category: "结尾引导",
                content: """
                用一句话收个尾。
 
@@ -619,6 +618,7 @@ final class Store: ObservableObject {
                我会一条条看。
 
                谢谢你看到这里。
-               """)
+               """,
+               category: "结尾引导")
     ]
 }
