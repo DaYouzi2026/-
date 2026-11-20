@@ -8,10 +8,10 @@ on:
 
 jobs:
   build:
-    # 别写死具体版本标签：macos-15 这个标签现在调不到机器，
-    # 任务会一直排队、15 分钟后被系统取消（日志一片空白）。
-    # macos-latest 实测 30 秒就能拿到机器。
-    runs-on: macos-latest
+    # macos-latest / macos-15 在美东工作时段（北京时间晚上）排队拿不到机器，
+    # job 启动后 15 分钟被系统取消（日志一片空白、runner 为空）。
+    # macos-14 是本项目原生环境（Xcode 15.x / objectVersion 56），池子相对空闲。
+    runs-on: macos-14
     timeout-minutes: 35
 
     steps:
