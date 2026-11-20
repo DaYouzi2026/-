@@ -72,6 +72,8 @@ final class CameraRecorder: NSObject, ObservableObject {
     private var mirrorSaveFlag = true
     /// 防抖档位（0 关 / 1 标准 / 2 电影级）。用户意图，实际生效的档位会降级后发到 stabilText
     private var stabilizationFlag = 1
+    /// 前后同拍用户意图。只在 native 模式生效；beauty 模式由界面强制切回。
+    private var pipWanted = false
 
     // 只在 videoQ 上读写
     private var recordingFlag = false
@@ -80,6 +82,8 @@ final class CameraRecorder: NSObject, ObservableObject {
     private var nativeModeV = false
     /// native 录制中：videoQ 上的副本，避免跨队列读 modeFlag
     private var nativeRecV = false
+    /// 前后同拍：videoQ 上的副本。开则每帧先叠副摄小窗再写盘。
+    private var pipOnV = false
     private var pendingURL: URL?
     private var writerReady = false
     private var previewPool: CVPixelBufferPool?
@@ -170,6 +174,8 @@ final class CameraRecorder: NSObject, ObservableObject {
     @Published private(set) var stabilText = ""
     @Published private(set) var isFront = true
     @Published private(set) var mode: Mode = .native
+    /// 前后同拍是否真的在生效（副摄会话起来了）。界面据此显示小窗取景与状态。
+    @Published private(set) var pipActive = false
     @Published private(set) var recordingError = ""
 
     var onAudio: ((AVAudioPCMBuffer) -> Void)?
@@ -211,9 +217,14 @@ final class CameraRecorder: NSObject, ObservableObject {
             if !self.session.isRunning {
                 self.session.startRunning()
             }
+            // 页面重进时恢复同拍（副摄会话上次离开页已被停掉）
+            if self.pipWanted && mode == .native {
+                DualCameraPip.shared.start(front: !front)
+            }
             DispatchQueue.main.async {
                 self.ready = true
                 self.mode = mode
+                self.pipActive = self.pipWanted && mode == .native
             }
         }
     }
@@ -275,6 +286,8 @@ final class CameraRecorder: NSObject, ObservableObject {
             if self.session.isRunning {
                 self.session.stopRunning()
             }
+            // 同拍副摄会话一并停掉，别让两颗摄像头一直被占着
+            DualCameraPip.shared.stop()
             // 会话停了就不再占麦克风；下次 start 会重新激活并补齐音频输入
             AudioSession.release()
             DispatchQueue.main.async { self.ready = false }
@@ -292,6 +305,10 @@ final class CameraRecorder: NSObject, ObservableObject {
             if self.nativeRecording { return }
             let target = !self.frontFlag
             self.configure(front: target)
+            // 同拍：主路换了镜头，副摄要翻到反面
+            if self.pipWanted {
+                DualCameraPip.shared.start(front: !target)  // start 内部会先停旧会话再建新的
+            }
         }
     }
 
@@ -303,6 +320,31 @@ final class CameraRecorder: NSObject, ObservableObject {
             guard !self.nativeRecording else { return }
             self.applyMirror()
         }
+    }
+
+    /// 开/关前后同拍。
+    /// 同拍只在原相机模式生效：调用方（界面）保证开启时已切回 native。
+    /// 副摄会话独立启停，主路录制完全不受影响；副摄起不来也只是没有小窗，视频照常录。
+    func setPip(_ on: Bool) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { self.setPip(on) }
+            return
+        }
+        pipWanted = on
+        if !on {
+            DualCameraPip.shared.stop()
+            videoQ.async { self.pipOnV = false }
+            pipActive = false
+            return
+        }
+        // 副摄拍「主路的反面」：主路前置拍人，副摄后置拍场景；反之亦然
+        let pipFront = !frontFlag
+        cfgQ.async {
+            DualCameraPip.shared.start(front: pipFront)
+        }
+        videoQ.async { self.pipOnV = true }
+        // pipActive 反映用户意图，界面据此立即显示小窗取景层，不因会话异步建立而闪烁
+        pipActive = true
     }
 
     /// 把镜像设置同步到视频连接。后置永远不镜像。
@@ -412,6 +454,16 @@ final class CameraRecorder: NSObject, ObservableObject {
             guard self.modeFlag != m else { return }
             guard !self.nativeRecording else { return }
             self.modeFlag = m
+            // 同拍只在原相机生效：万一被切到美颜，副摄与合成一起关掉
+            if m == .beauty {
+                self.videoQ.async { self.pipOnV = false }
+                DualCameraPip.shared.stop()
+                DispatchQueue.main.async { self.pipActive = false }
+            } else if self.pipWanted {
+                self.videoQ.async { self.pipOnV = true }
+                DualCameraPip.shared.start(front: !self.frontFlag)
+                DispatchQueue.main.async { self.pipActive = true }
+            }
             self.session.beginConfiguration()
             self.syncAudioInputForMode()
             self.configureOutputs()
@@ -1053,7 +1105,15 @@ final class CameraRecorder: NSObject, ObservableObject {
         // 预览走 AVCaptureVideoPreviewLayer，不经过这里 —— 所以这条路上没有多余开销，
         // 4K 也不会因为跑美颜管线掉帧。
         if nativeModeV {
-            if nativeRecV { movie.appendVideo(sb) }
+            if nativeRecV {
+                // 前后同拍：主帧叠上副摄小窗再写盘。合成失败会返回 nil，
+                // 那时直接写原帧 —— 同拍坏了也绝不拖累这条录制。
+                if pipOnV, let composed = DualCameraPip.shared.composite(main: sb) {
+                    movie.appendVideo(composed)
+                } else {
+                    movie.appendVideo(sb)
+                }
+            }
             return
         }
 

@@ -207,6 +207,8 @@ struct PrompterView: View {
     @AppStorage(Pref.mirrorSave) private var mirrorSave = true
     /// 视频防抖档位（0 关 / 1 标准 / 2 电影级）
     @AppStorage(Pref.stabilization) private var stabilization = 1
+    /// 前后同拍（画中画），仅原相机模式生效
+    @AppStorage(Pref.pip) private var pipOn = false
 
     @AppStorage(Pref.beautyOn) private var beautyOn = false
     @AppStorage(Pref.bSmooth) private var bSmooth = 0.36
@@ -310,6 +312,7 @@ struct PrompterView: View {
         .onChange(of: mirrorSave) { v in cam.setMirrorSave(v) }
         .onChange(of: stabilization) { v in cam.setStabilization(v) }
         .onChange(of: beautyOn) { v in switchMode(v) }
+        .onChange(of: pipOn) { v in applyPip(v) }
         .onChange(of: bSmooth) { _ in pushBeauty() }
         .onChange(of: bWhiten) { _ in pushBeauty() }
         .onChange(of: bRosy) { _ in pushBeauty() }
@@ -342,10 +345,35 @@ struct PrompterView: View {
                     FilterPreview()
                 } else {
                     CameraPreview(session: cam.session, mirrored: cam.isFront && mirrorSave)
+                    // 前后同拍：右上角叠一个副摄取景小窗，和成片里的位置一致
+                    if pipOn && cam.pipActive && cam.mode == .native {
+                        pipPreview
+                    }
                 }
             }
             .ignoresSafeArea()
         }
+    }
+
+    /// 副摄取景小窗（无交互），位置和录进成片的小窗一致：右上角
+    private var pipPreview: some View {
+        GeometryReader { g in
+            let short = min(g.size.width, g.size.height)
+            let side = short * 0.30
+            let margin = short * 0.045
+            PipPreviewView(session: DualCameraPip.shared.previewSession,
+                           mirrored: !cam.isFront)   // 副摄与主路相反镜头
+                .frame(width: side, height: side)
+                .clipShape(RoundedRectangle(cornerRadius: side * 0.22, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: side * 0.22, style: .continuous)
+                        .stroke(Color.white.opacity(0.9), lineWidth: 2)
+                )
+                .shadow(radius: 6)
+                .position(x: g.size.width - margin - side / 2,
+                          y: margin + side / 2)
+        }
+        .allowsHitTesting(false)
     }
 
     private var vignette: some View {
@@ -551,6 +579,7 @@ struct PrompterView: View {
             toolItem("waveform", "跟读", followOn) { toggleFollow() }
             toolItem("arrow.down.to.line", "匀速", autoScroll) { toggleAuto() }
             toolItem("arrow.left.arrow.right", "镜像", mirror) { mirror.toggle() }
+            toolItem("rectangle.on.rectangle", "同拍", pipOn) { pipOn.toggle() }
             toolItem("rectangle.dashed", "提词框", false) { showSettings = true }
             toolItem("arrow.counterclockwise", "重来", false) { restart() }
         }
@@ -714,6 +743,19 @@ struct PrompterView: View {
                                     .font(.system(size: 13))
                                     .foregroundColor(T.ink2)
                                 Text("成片和取景框同方向。关掉会存真实方向，自拍左右会反过来")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(T.sub)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                        .tint(T.accent)
+
+                        Toggle(isOn: $pipOn) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("前后同拍（画中画）")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(T.ink2)
+                                Text("主画面拍场景，另一颗镜头的小窗叠在右上角，一起录进视频。仅原相机模式可用，开启会自动切回原相机")
                                     .font(.system(size: 11))
                                     .foregroundColor(T.sub)
                                     .fixedSize(horizontal: false, vertical: true)
@@ -1103,10 +1145,33 @@ struct PrompterView: View {
                                                     preset: BeautyFilterPreset(rawValue: bPreset) ?? .natural)
     }
 
+    /// 前后同拍开关：只在原相机模式生效，录制中不能切。
+    private func applyPip(_ on: Bool) {
+        guard !cam.recording else {
+            pipOn = !on
+            showTip("录制中不能切同拍，停了再切")
+            return
+        }
+        if on && beautyOn {
+            // 同拍走的是原相机的合成管线，强制切回原相机
+            ignoreBeautyChange = true
+            beautyOn = false
+            cam.setMode(.native)
+            showTip("前后同拍已开启，已切回原相机")
+        }
+        Haptics.tap()
+        cam.setPip(on)
+    }
+
     private func switchMode(_ on: Bool) {
         if ignoreBeautyChange {
             ignoreBeautyChange = false
             return
+        }
+        // 开美颜时自动关掉同拍（两者管线互斥）
+        if on && pipOn {
+            pipOn = false
+            cam.setPip(false)
         }
         guard !cam.recording else {
             ignoreBeautyChange = true
