@@ -39,7 +39,10 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
     }
 
-    let session = AVCaptureSession()
+    /// v1.28：改用多摄会话。前后同拍时主摄 + 副摄挂在**同一个**会话上同时采，
+    /// 彻底避免"两个独立 AVCaptureSession 互相抢摄像头"导致的黑屏 / 定屏。
+    /// AVCaptureMultiCamSession 是 AVCaptureSession 子类，单摄路径行为一致。
+    let session = AVCaptureMultiCamSession()
 
     /// v1.27：native 与 beauty 都走 AVAssetWriter，native 用它把音视频写进同一个 mp4。
     private let movie = MovieWriter()
@@ -217,10 +220,7 @@ final class CameraRecorder: NSObject, ObservableObject {
             if !self.session.isRunning {
                 self.session.startRunning()
             }
-            // 页面重进时恢复同拍（副摄会话上次离开页已被停掉）
-            if self.pipWanted && mode == .native {
-                DualCameraPip.shared.start(front: !front)
-            }
+            // configure 已按 pipWanted 把副摄挂进同一会话，无需单独启停
             DispatchQueue.main.async {
                 self.ready = true
                 self.mode = mode
@@ -286,8 +286,9 @@ final class CameraRecorder: NSObject, ObservableObject {
             if self.session.isRunning {
                 self.session.stopRunning()
             }
-            // 同拍副摄会话一并停掉，别让两颗摄像头一直被占着
-            DualCameraPip.shared.stop()
+            // 副摄与主摄同属一个会话，session.stopRunning 会一起停掉，无需单独处理；
+            // 清掉冻结帧，避免下次进页看到上一轮的定格画面
+            DualCameraPip.shared.clearFrames()
             // 会话停了就不再占麦克风；下次 start 会重新激活并补齐音频输入
             AudioSession.release()
             DispatchQueue.main.async { self.ready = false }
@@ -305,10 +306,7 @@ final class CameraRecorder: NSObject, ObservableObject {
             if self.nativeRecording { return }
             let target = !self.frontFlag
             self.configure(front: target)
-            // 同拍：主路换了镜头，副摄要翻到反面
-            if self.pipWanted {
-                DualCameraPip.shared.start(front: !target)  // start 内部会先停旧会话再建新的
-            }
+            // configure 内已按新的 front 重挂副摄（attachPipLocked 会先摘旧再挂新）
         }
     }
 
@@ -324,27 +322,27 @@ final class CameraRecorder: NSObject, ObservableObject {
 
     /// 开/关前后同拍。
     /// 同拍只在原相机模式生效：调用方（界面）保证开启时已切回 native。
-    /// 副摄会话独立启停，主路录制完全不受影响；副摄起不来也只是没有小窗，视频照常录。
+    /// v1.28：不再开独立会话——在同一个多摄会话里增删副摄 input/output。
     func setPip(_ on: Bool) {
         guard Thread.isMainThread else {
             DispatchQueue.main.async { self.setPip(on) }
             return
         }
         pipWanted = on
-        if !on {
-            DualCameraPip.shared.stop()
-            videoQ.async { self.pipOnV = false }
-            pipActive = false
-            return
-        }
-        // 副摄拍「主路的反面」：主路前置拍人，副摄后置拍场景；反之亦然
-        let pipFront = !frontFlag
         cfgQ.async {
-            DualCameraPip.shared.start(front: pipFront)
+            guard !self.nativeRecording else { return }
+            self.session.beginConfiguration()
+            if on {
+                // 副摄拍「主路的反面」：主路前置拍人，副摄后置拍场景；反之亦然
+                self.attachPipLocked(front: !self.frontFlag)
+            } else {
+                self.detachPipLocked()
+            }
+            self.session.commitConfiguration()
         }
-        videoQ.async { self.pipOnV = true }
+        videoQ.async { self.pipOnV = on }
         // pipActive 反映用户意图，界面据此立即显示小窗取景层，不因会话异步建立而闪烁
-        pipActive = true
+        pipActive = on
     }
 
     /// 把镜像设置同步到视频连接。后置永远不镜像。
@@ -454,19 +452,19 @@ final class CameraRecorder: NSObject, ObservableObject {
             guard self.modeFlag != m else { return }
             guard !self.nativeRecording else { return }
             self.modeFlag = m
-            // 同拍只在原相机生效：万一被切到美颜，副摄与合成一起关掉
+            // 同拍只在原相机生效：切到美颜关副摄，切回原相机且用户仍想要时重挂。
+            // 注意副摄 input/output 与 configureOutputs 清掉的 output 是同一批，
+            // 所以统一在下面的配置事务里按最新 modeFlag / pipWanted 重挂一次。
             if m == .beauty {
                 self.videoQ.async { self.pipOnV = false }
-                DualCameraPip.shared.stop()
                 DispatchQueue.main.async { self.pipActive = false }
-            } else if self.pipWanted {
-                self.videoQ.async { self.pipOnV = true }
-                DualCameraPip.shared.start(front: !self.frontFlag)
-                DispatchQueue.main.async { self.pipActive = true }
             }
             self.session.beginConfiguration()
             self.syncAudioInputForMode()
             self.configureOutputs()
+            if m == .native && self.pipWanted {
+                self.attachPipLocked(front: !self.frontFlag)
+            }
             if let dev = self.videoIn?.device {
                 self.applyFormat(dev)
                 // 刚换了格式（美颜 1080P ↔ 原相机 4K），支持的防抖档位也可能跟着变，
@@ -637,7 +635,51 @@ final class CameraRecorder: NSObject, ObservableObject {
 
         applyFormat(dev)
         configureOutputs()
+        // 同拍：把副摄（主路的反面）作为一个额外 input/output 挂进**同一个**多摄会话。
+        // 这里必须在配置事务内、主摄 output 加完之后做。失败只影响小窗，主摄照常。
+        if pipWanted && modeFlag == .native {
+            attachPipLocked(front: !front)
+        }
         publishActual(dev, front: front)
+    }
+
+    /// 在会话配置事务内（cfgQ）把副摄 input/output 挂进多摄会话。
+    /// front = 副摄是否用前置。重复调用会先摘旧再挂新，方向切换安全。
+    private func attachPipLocked(front: Bool) {
+        let pip = DualCameraPip.shared
+        // 先摘掉可能存在的旧副摄（config 重建 input 时会清掉，这里兜底）
+        detachPipLocked()
+        guard let pin = pip.makeInput(front: front) else { return }
+        guard session.canAddInput(pin) else {
+            Diag.note("同拍：多摄会话拒绝副摄 input（成本预算或格式不符）")
+            return
+        }
+        session.addInput(pin)
+        pip.prepareOutput()
+        guard session.canAddOutput(pip.videoOut) else {
+            Diag.note("同拍：多摄会话拒绝副摄 output")
+            session.removeInput(pin)
+            return
+        }
+        session.addOutput(pip.videoOut)
+        // 副摄输出方向：竖屏。镜像在冻结帧里已按 front 处理，这里只管方向。
+        if let pc = pip.videoOut.connection(with: .video), pc.isVideoOrientationSupported {
+            pc.videoOrientation = .portrait
+        }
+        pip.markAttached()
+        Diag.note("同拍：副摄已挂进多摄会话（\(front ? "前置" : "后置")，同一会话不再抢摄像头）")
+    }
+
+    /// 在会话配置事务内（cfgQ）把副摄从多摄会话摘掉
+    private func detachPipLocked() {
+        let pip = DualCameraPip.shared
+        if let pin = pip.deviceIn, session.inputs.contains(pin) {
+            session.removeInput(pin)
+        }
+        if session.outputs.contains(pip.videoOut) {
+            session.removeOutput(pip.videoOut)
+        }
+        pip.markDetached()
     }
 
     /// 加麦克风输入。首次授权那一刻音频设备常常还没就绪，`AVCaptureDeviceInput` 会直接抛错；
@@ -740,10 +782,14 @@ final class CameraRecorder: NSObject, ObservableObject {
         let side = modeFlag == .beauty ? min(quality.shortSide, 1080) : quality.shortSide
         let targetFps = modeFlag == .beauty ? min(fps, 30) : fps
 
+        // 多摄会话只认 inputPriority：分辨率由每个 input 自己的 activeFormat 决定，
+        // 设 .hd4K3840x2160 这类固定 preset 会被拒甚至让两路采集直接失败。
         if session.canSetSessionPreset(.inputPriority) {
             session.sessionPreset = .inputPriority
         }
 
+        // bestFormat 现在只返回 isMultiCamSupported 的格式（见该函数），
+        // 主副摄格式一致，多摄成本预算才算得过来。
         if let f = bestFormat(dev, short: side, fps: targetFps) {
             do {
                 try dev.lockForConfiguration()
@@ -752,28 +798,22 @@ final class CameraRecorder: NSObject, ObservableObject {
                 dev.activeVideoMinFrameDuration = dur
                 dev.activeVideoMaxFrameDuration = dur
                 dev.unlockForConfiguration()
-                return
             } catch {
-                // 掉到下面的预设兜底
+                Diag.note("格式锁定失败 \(error.localizedDescription)")
             }
         }
-
-        if side >= 2000, session.canSetSessionPreset(.hd4K3840x2160) {
-            session.sessionPreset = .hd4K3840x2160
-        } else if side >= 1000, session.canSetSessionPreset(.hd1920x1080) {
-            session.sessionPreset = .hd1920x1080
-        } else if session.canSetSessionPreset(.hd1280x720) {
-            session.sessionPreset = .hd1280x720
-        } else {
-            session.sessionPreset = .high
-        }
+        // 不再用 sessionPreset 兜底：多摄会话下它没有意义，反而会破坏已设的 activeFormat
     }
 
     private func bestFormat(_ dev: AVCaptureDevice, short: CGFloat, fps: Int) -> AVCaptureDevice.Format? {
         var best: AVCaptureDevice.Format?
         var bestScore = -Double.greatestFiniteMagnitude
 
-        for f in dev.formats {
+        // v1.28：会话改成 AVCaptureMultiCamSession 后，只有 isMultiCamSupported 的格式
+        // 才能加进会话并稳定运行（否则 addInput 会被拒、startRunning 直接失败）。
+        // 单摄时也走这个格式集——画质上限会比纯 4K 低一点，这是两摄可同时工作的前提，
+        // Apple 系统相机的"双摄视频"同样降质。口播场景 1080p 足够。
+        for f in dev.formats where f.isMultiCamSupported {
             let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
             let s = CGFloat(min(d.width, d.height))
             let l = CGFloat(max(d.width, d.height))
@@ -791,6 +831,8 @@ final class CameraRecorder: NSObject, ObservableObject {
                 best = f
             }
         }
+        // 目标分辨率没有任何多摄格式匹配时，退到任意多摄格式，绝不用非多摄格式
+        if best == nil { best = dev.formats.first { $0.isMultiCamSupported } }
         return best
     }
 
@@ -1987,6 +2029,9 @@ extension CameraRecorder: AVCaptureVideoDataOutputSampleBufferDelegate,
                        from connection: AVCaptureConnection) {
         if output === videoOut {
             handleVideo(sampleBuffer)
+        } else if output === DualCameraPip.shared.videoOut {
+            // 同拍副摄帧：交给合成器冻结缓存，不写盘（写盘的是合成后的主帧）
+            DualCameraPip.shared.captureOutput(output, didOutput: sampleBuffer, from: connection)
         } else {
             handleAudio(sampleBuffer)
         }

@@ -4,129 +4,148 @@ import CoreVideo
 import CoreImage
 import UIKit
 import SwiftUI
+import Combine
 
-/// 前后同拍（画中画）合成器。
+/// 前后同拍（画中画）副摄采集 + 合成器。
 ///
-/// iOS 不允许前后摄同时接进一个 AVCaptureSession，所以这里开一条**独立的副摄会话**：
-/// 主路（CameraRecorder.session）照常拍你选的镜头 + 音频，副摄会话专门拍另一颗镜头，
-/// 只取视频帧、不碰麦克风（音频仍由主路负责，绝不会两路抢麦）。
+/// ── 为什么必须用 AVCaptureMultiCamSession ──────────────────────────────
+/// 早期版本给副摄开了**独立** AVCaptureSession。iOS 不允许同一个 App 里两个
+/// 采集会话同时占用摄像头：副摄一 startRunning，主摄立刻收到
+/// AVCaptureSessionWasInterrupted(videoDeviceInUseByAnotherClient)，随后两者
+/// 互相打断 —— 表现就是主画面黑屏 / 小窗定屏、日志刷屏「相机会话被中断」。
 ///
-/// 写帧前，把副摄最新一帧裁成圆角小窗画到主帧右上角，再交给 MovieWriter，
-/// 成片里因此同时有两颗镜头的画面 —— 主画面是你拍的场景，小窗是你自己（或反过来）。
-///
-/// 任何一步失败（副摄打不开、取不到帧、合成异常）都返回 nil，
-/// 让调用方直接写原主帧：**同拍坏了也不能把正常录制搞崩**。
-final class DualCameraPip: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+/// 现在改为：主摄 + 副摄都挂在 CameraRecorder 的**同一个** AVCaptureMultiCamSession
+/// 上（Apple 官方 AVMultiCamPiP 的做法，iOS 13+，iPhone 13 的 A14 完全支持）。
+/// 一个会话同时采两路，不再有互抢。class 只负责：
+///   · 按多摄格式集创建副摄 input / 配置副摄 output（真正 add 由 CameraRecorder 做）
+///   · 冻结副摄帧（供合成 + 小窗预览）
+///   · 把副摄小窗合成到主帧右上角
+/// 任何一步失败都返回 nil，让主路照常只写主画面 —— 同拍坏了也不拖垮录制。
+final class DualCameraPip: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, ObservableObject {
 
     static let shared = DualCameraPip()
     private override init() {}
 
-    private let session = AVCaptureSession()
-    private let videoOut = AVCaptureVideoDataOutput()
-    private let cfgQ = DispatchQueue(label: "tidanci.pip.config")
+    /// 副摄视频输出。由 CameraRecorder 加进多摄会话，delegate 指向本类。
+    let videoOut = AVCaptureVideoDataOutput()
+    /// 副摄 input（由 makeInput 建、CameraRecorder add；持有引用便于摘除）
+    private(set) var deviceIn: AVCaptureDeviceInput?
+
     private let frameQ = DispatchQueue(label: "tidanci.pip.frame")
     private let lock = NSLock()
-
-    /// 两个 CIContext 分开用，避免采集队列与写入队列同时渲染同一个 context
     private let captureCtx = CIContext(options: [.workingColorSpace: NSNull()])
     private let renderCtx = CIContext(options: [.workingColorSpace: NSNull()])
 
-    private var deviceIn: AVCaptureDeviceInput?
-    private var running = false
     private var pipIsFront = false
-    /// 副摄最新一帧，引用的是**独占** CVPixelBuffer（不参与 AVCapture 的 buffer 复用），
-    /// 合成时读到的永远是稳定画面，不会花屏。
+    /// 副摄最新一帧（独占 buffer 冻结，不参与 AVCapture 复用，合成时不会花屏）
     private var latest: CIImage?
-    private var latestSize = CGSize.zero
-    /// 副摄帧节流：小窗画面更新到 ~20fps 就够，省内存与算力
     private var lastFreezeAt: CFTimeInterval = 0
 
-    private(set) var available = false
+    @Published private(set) var available = false
+    /// 小窗预览图：直接用冻结帧生成，方向和成片一致，不依赖多摄预览层绑定
+    @Published private(set) var previewImage: UIImage?
 
-    // MARK: - 生命周期
+    // MARK: - 多摄格式辅助
 
-    /// front = true 表示副摄用前置（主路此时拍的是后置场景）。
-    /// 重复调用会先停旧会话再按新方向重建，切镜头时直接再调一次即可。
-    func start(front: Bool) {
-        cfgQ.async { self.buildLocked(front: front) }
+    /// 取指定方向的宽角摄像头（前后各一颗）
+    static func camera(front: Bool) -> AVCaptureDevice? {
+        let pos: AVCaptureDevice.Position = front ? .front : .back
+        if let d = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: pos) {
+            return d
+        }
+        let ds = AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInWideAngleCamera],
+                                                  mediaType: .video, position: pos)
+        return ds.devices.first
     }
 
-    func stop() {
-        cfgQ.async { self.stopLocked() }
+    /// 从设备支持的**多摄兼容**格式里挑一个（multi-cam 会话只能用 isMultiCamSupported 的格式）
+    static func multiCamFormat(_ dev: AVCaptureDevice, short: CGFloat, fps: Int) -> AVCaptureDevice.Format? {
+        var best: AVCaptureDevice.Format?
+        var bestScore = -Double.greatestFiniteMagnitude
+        for f in dev.formats where f.isMultiCamSupported {
+            let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+            let s = CGFloat(min(d.width, d.height))
+            let l = CGFloat(max(d.width, d.height))
+            guard s > 0 else { continue }
+            let ar = l / s
+            guard abs(ar - 16.0 / 9.0) < 0.06 else { continue }
+            guard f.videoSupportedFrameRateRanges.contains(where: { $0.maxFrameRate >= Double(fps) - 0.5 }) else { continue }
+            var score = -Double(abs(s - short)) * 4.0
+            if abs(s - short) < 1 { score += 400 }
+            if score > bestScore { bestScore = score; best = f }
+        }
+        return best
     }
 
-    /// 在 cfgQ 上同步执行：先彻底停掉，再按方向建会话
-    private func buildLocked(front: Bool) {
-        stopLocked()
+    // MARK: - 副摄 input / output
+
+    /// 按方向建副摄 input 并锁定多摄格式。**在 cfgQ 上调用**；真正的 add 由 CameraRecorder 做。
+    func makeInput(front: Bool) -> AVCaptureDeviceInput? {
         guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else {
             Diag.note("同拍：没有相机权限")
-            return
+            return nil
         }
-        let pos: AVCaptureDevice.Position = front ? .front : .back
-        guard let dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: pos) else {
+        guard let dev = Self.camera(front: front) else {
             Diag.note("同拍：找不到\(front ? "前置" : "后置")副摄")
-            return
+            return nil
         }
-        self.pipIsFront = front
-
-        self.session.beginConfiguration()
-        if self.session.canSetSessionPreset(.hd1280x720) {
-            self.session.sessionPreset = .hd1280x720   // 小窗够用，省性能，主路画质不受影响
+        if let fmt = Self.multiCamFormat(dev, short: 720, fps: 30) {
+            do {
+                try dev.lockForConfiguration()
+                dev.activeFormat = fmt
+                let dur = CMTime(value: 1, timescale: 30)
+                dev.activeVideoMinFrameDuration = dur
+                dev.activeVideoMaxFrameDuration = dur
+                dev.unlockForConfiguration()
+            } catch {
+                Diag.note("同拍：副摄格式设置失败 \(error.localizedDescription)")
+            }
         }
-        if let old = self.deviceIn { self.session.removeInput(old); self.deviceIn = nil }
         do {
             let inp = try AVCaptureDeviceInput(device: dev)
-            guard self.session.canAddInput(inp) else {
-                self.session.commitConfiguration()
-                Diag.note("同拍：副摄输入加不进会话")
-                return
-            }
-            self.session.addInput(inp)
-            self.deviceIn = inp
+            deviceIn = inp
+            pipIsFront = front
+            return inp
         } catch {
-            self.session.commitConfiguration()
-            Diag.note("同拍：副摄输入建不起来 \(error.localizedDescription)")
-            return
+            Diag.note("同拍：副摄 input 建不起来 \(error.localizedDescription)")
+            return nil
         }
+    }
 
-        for o in self.session.outputs { self.session.removeOutput(o) }
-        self.videoOut.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String:
-                                        Int(kCVPixelFormatType_32BGRA)]
-        self.videoOut.alwaysDiscardsLateVideoFrames = true
-        self.videoOut.setSampleBufferDelegate(self, queue: self.frameQ)
-        guard self.session.canAddOutput(self.videoOut) else {
-            self.session.commitConfiguration()
-            Diag.note("同拍：副摄输出加不进会话")
-            return
-        }
-        self.session.addOutput(self.videoOut)
-        self.session.commitConfiguration()
-        self.session.startRunning()
-        self.running = true
+    /// output 基础配置（add 之前调一次即可）
+    func prepareOutput() {
+        videoOut.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String:
+                                    Int(kCVPixelFormatType_32BGRA)]
+        videoOut.alwaysDiscardsLateVideoFrames = true
+        videoOut.setSampleBufferDelegate(self, queue: frameQ)
+    }
+
+    /// input/output 已加进会话：标记可用
+    func markAttached() {
         DispatchQueue.main.async { self.available = true }
-        Diag.note("同拍：副摄已启动（\(front ? "前置" : "后置")）")
     }
 
-    /// 必须在 cfgQ 上调用
-    private func stopLocked() {
-        guard running else { return }
-        session.stopRunning()
-        if let d = deviceIn { session.removeInput(d); deviceIn = nil }
-        running = false
+    /// 会话已摘除副摄：清帧
+    func markDetached() {
         lock.lock(); latest = nil; lock.unlock()
-        DispatchQueue.main.async { self.available = false }
-        Diag.note("同拍：副摄已停")
+        deviceIn = nil
+        DispatchQueue.main.async {
+            self.available = false
+            self.previewImage = nil
+        }
     }
 
-    /// 取景框预览用的会话（界面拿它渲染一个小取景层）
-    var previewSession: AVCaptureSession { session }
+    /// 只清冻结帧（页面离开但会话未必拆时调用）
+    func clearFrames() {
+        lock.lock(); latest = nil; lock.unlock()
+    }
 
     // MARK: - 副摄帧采集
 
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
-        // 节流：~20fps 更新一次小窗即可，避免每帧都新建 buffer
+        // 节流：小窗 ~20fps 足够，避免每帧新建 buffer 造成内存抖动
         let now = CACurrentMediaTime()
         guard now - lastFreezeAt >= 1.0 / 20.0 else { return }
         lastFreezeAt = now
@@ -136,10 +155,9 @@ final class DualCameraPip: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         let h = CVPixelBufferGetHeight(px)
         guard w > 0, h > 0 else { return }
 
-        // 按实际宽高判断方向：横帧转竖，竖帧保持，避免机型差异
         var img = CIImage(cvPixelBuffer: px)
-        if w > h { img = img.oriented(.right) }
-        if pipIsFront { img = img.oriented(.upMirrored) }   // 前置小窗照镜子
+        if w > h { img = img.oriented(.right) }              // 横帧转竖，和主画面一致
+        if pipIsFront { img = img.oriented(.upMirrored) }    // 前置小窗照镜子
 
         let outW = w > h ? h : w
         let outH = w > h ? w : h
@@ -159,28 +177,26 @@ final class DualCameraPip: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
               let buf = frozen else { return }
         captureCtx.render(fitted, to: buf)
         let still = CIImage(cvPixelBuffer: buf)
-        lock.lock()
-        latest = still
-        latestSize = CGSize(width: outW, height: outH)
-        lock.unlock()
+        lock.lock(); latest = still; lock.unlock()
+
+        // 小窗预览直接用这帧（独占 buffer，延迟渲染安全）
+        let ui = UIImage(ciImage: still)
+        DispatchQueue.main.async { self.previewImage = ui }
     }
 
     // MARK: - 合成
 
-    /// 把主帧 + 副摄小窗合成成 BGRA CMSampleBuffer 交给写入器。
-    /// 返回 nil 表示失败，调用方应直接写原帧（降级）。
+    /// 主帧 + 副摄小窗合成成 BGRA sample buffer 交给写入器。
+    /// 返回 nil 表示失败，调用方直接写原帧（降级）。
     func composite(main: CMSampleBuffer) -> CMSampleBuffer? {
         guard let mainPx = CMSampleBufferGetImageBuffer(main) else { return nil }
         let mw = CVPixelBufferGetWidth(mainPx)
         let mh = CVPixelBufferGetHeight(mainPx)
         guard mw > 0, mh > 0 else { return nil }
 
-        let mainImg = CIImage(cvPixelBuffer: mainPx)
-        var out = mainImg
+        var out = CIImage(cvPixelBuffer: mainPx)
 
-        lock.lock()
-        let pip = latest
-        lock.unlock()
+        lock.lock(); let pip = latest; lock.unlock()
 
         if let pip = pip, pip.extent.width > 0, pip.extent.height > 0 {
             let short = min(CGFloat(mw), CGFloat(mh))
@@ -188,7 +204,6 @@ final class DualCameraPip: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             let margin = short * 0.045
             let radius = side * 0.22
 
-            // 副摄帧居中裁正方形 → 原点到 (0,0) → 缩到小窗尺寸
             let ext = pip.extent
             let s = min(ext.width, ext.height)
             let crop = CGRect(x: ext.midX - s / 2, y: ext.midY - s / 2, width: s, height: s)
@@ -196,18 +211,15 @@ final class DualCameraPip: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 .transformed(by: CGAffineTransform(translationX: -crop.origin.x, y: -crop.origin.y))
             let scaled = zeroed.transformed(by: CGAffineTransform(scaleX: side / s, y: side / s))
 
-            // 圆角遮罩：白色实心圆角矩形，用 sourceIn 裁出圆角画面
             let mask = Self.filledRound(size: side, radius: radius)
             let roundPip = Self.blend(scaled, mode: "CISourceInCompositing", over: mask)
 
-            // 白色描边：外圆角矩形 sourceOut 内圆角矩形 = 中空边框
             let pad = max(2, side * 0.015)
             let outer = Self.filledRound(size: side, radius: radius)
             let inner = Self.filledRound(size: side - pad * 2, radius: max(0, radius - pad))
                 .transformed(by: CGAffineTransform(translationX: pad, y: pad))
             let border = Self.blend(outer, mode: "CISourceOutCompositing", over: inner)
 
-            // 放到主帧右上角（CI 坐标原点在左下）
             let ox = CGFloat(mw) - side - margin
             let oy = CGFloat(mh) - side - margin
             let shift = CGAffineTransform(translationX: ox, y: oy)
@@ -216,7 +228,6 @@ final class DualCameraPip: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             out = border.transformed(by: shift).composited(over: out)
         }
 
-        // 渲染回 BGRA PixelBuffer（和 BeautyWriter 同格式，写入器稳定）
         var pb: CVPixelBuffer?
         let attrs: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
@@ -229,8 +240,8 @@ final class DualCameraPip: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
               let buffer = pb else { return nil }
         renderCtx.render(out, to: buffer)
 
-        // 用主帧的 timing 包装新 sample buffer，PTS 完全对齐主帧（音画不会错拍）
-        var timing = CMSampleTimingInfo(duration: CMSampleBufferGetDuration(main),
+        // 主帧的 timing 原样复用，PTS 完全对齐（音画不错拍）
+        let timing = CMSampleTimingInfo(duration: CMSampleBufferGetDuration(main),
                                         presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(main),
                                         decodeTimeStamp: CMSampleBufferGetDecodeTimeStamp(main))
         var format: CMVideoFormatDescription?
@@ -245,7 +256,7 @@ final class DualCameraPip: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                                                  makeDataReadyCallback: nil,
                                                  refcon: nil,
                                                  formatDescription: fmt,
-                                                 sampleTiming: &timing,
+                                                 sampleTiming: timing,
                                                  sampleBufferOut: &result) == noErr,
               let sb = result else { return nil }
         return sb
@@ -275,49 +286,22 @@ final class DualCameraPip: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
 }
 
-// MARK: - 副摄取景小窗
+// MARK: - 副摄小窗预览（直接显示冻结帧，方向/内容与成片一致）
 
-/// 把副摄会话渲染成一个预览层（无交互），叠在主画面右上角。
-struct PipPreviewView: UIViewRepresentable {
-    let session: AVCaptureSession
-    var mirrored: Bool = false
+/// 圆角小窗里显示副摄冻结帧。不依赖 AVCaptureVideoPreviewLayer 的多摄 connection 绑定，
+/// 因此不会出现"主预览连到副摄"或"小窗黑屏"的问题。
+struct PipPreviewView: View {
+    let image: UIImage?
 
-    func makeUIView(context: Context) -> PipPreviewLayerView {
-        let v = PipPreviewLayerView()
-        v.backgroundColor = .black
-        v.previewLayer.session = session
-        v.previewLayer.videoGravity = .resizeAspectFill
-        v.mirrored = mirrored
-        return v
-    }
-
-    func updateUIView(_ uiView: PipPreviewLayerView, context: Context) {
-        if uiView.previewLayer.session !== session {
-            uiView.previewLayer.session = session
-        }
-        uiView.mirrored = mirrored
-        uiView.syncMirror()
-    }
-}
-
-final class PipPreviewLayerView: UIView {
-    override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
-    var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
-
-    var mirrored: Bool = false {
-        didSet { syncMirror() }
-    }
-
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        syncMirror()
-    }
-
-    func syncMirror() {
-        guard let c = previewLayer.connection else { return }
-        if c.isVideoMirroringSupported {
-            if c.automaticallyAdjustsVideoMirroring { c.automaticallyAdjustsVideoMirroring = false }
-            if c.isVideoMirrored != mirrored { c.isVideoMirrored = mirrored }
+    var body: some View {
+        Group {
+            if let image = image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                Color.black
+            }
         }
     }
 }

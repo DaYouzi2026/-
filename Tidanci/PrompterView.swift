@@ -192,6 +192,8 @@ struct PrompterView: View {
     // AVCaptureSession 会抢麦克风 —— 一个拿走，另一个的音频整场变哑。
     // 用单例后重新进页只是重启同一个会话，录制状态也能跨页面保留。
     @ObservedObject private var cam = CameraRecorder.shared
+    /// 前后同拍副摄：订阅冻结帧，刷新右上角小窗取景
+    @ObservedObject private var pip = DualCameraPip.shared
     @StateObject private var speech = SpeechFollower()
     @StateObject private var engine = PrompterEngine()
 
@@ -361,8 +363,7 @@ struct PrompterView: View {
             let short = min(g.size.width, g.size.height)
             let side = short * 0.30
             let margin = short * 0.045
-            PipPreviewView(session: DualCameraPip.shared.previewSession,
-                           mirrored: !cam.isFront)   // 副摄与主路相反镜头
+            PipPreviewView(image: DualCameraPip.shared.previewImage)
                 .frame(width: side, height: side)
                 .clipShape(RoundedRectangle(cornerRadius: side * 0.22, style: .continuous))
                 .overlay(
