@@ -230,7 +230,7 @@ final class DualCameraPip: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         renderCtx.render(out, to: buffer)
 
         // 用主帧的 timing 包装新 sample buffer，PTS 完全对齐主帧（音画不会错拍）
-        let timing = CMSampleTimingInfo(duration: CMSampleBufferGetDuration(main),
+        var timing = CMSampleTimingInfo(duration: CMSampleBufferGetDuration(main),
                                         presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(main),
                                         decodeTimeStamp: CMSampleBufferGetDecodeTimeStamp(main))
         var format: CMVideoFormatDescription?
