@@ -23,6 +23,8 @@ enum Pref {
     static let stabilization = "p.stabilization"
     /// 前后同拍（画中画）：主画面 + 另一颗镜头小窗录进同一条视频，仅原相机模式生效
     static let pip = "p.pip"
+    /// 同拍小窗大小：占画面短边的比例（Double，0.18~0.48，默认 0.30）
+    static let pipSize = "p.pipSize"
 
     // 提词框
     static let boxX = "p.box.x"

@@ -211,6 +211,8 @@ struct PrompterView: View {
     @AppStorage(Pref.stabilization) private var stabilization = 1
     /// 前后同拍（画中画），仅原相机模式生效
     @AppStorage(Pref.pip) private var pipOn = false
+    /// 同拍小窗大小（占画面短边比例）
+    @AppStorage(Pref.pipSize) private var pipSize = 0.30
 
     @AppStorage(Pref.beautyOn) private var beautyOn = false
     @AppStorage(Pref.bSmooth) private var bSmooth = 0.36
@@ -315,6 +317,7 @@ struct PrompterView: View {
         .onChange(of: stabilization) { v in cam.setStabilization(v) }
         .onChange(of: beautyOn) { v in switchMode(v) }
         .onChange(of: pipOn) { v in applyPip(v) }
+        .onChange(of: pipSize) { v in DualCameraPip.shared.pipSizeRatio = v }
         .onChange(of: bSmooth) { _ in pushBeauty() }
         .onChange(of: bWhiten) { _ in pushBeauty() }
         .onChange(of: bRosy) { _ in pushBeauty() }
@@ -361,7 +364,7 @@ struct PrompterView: View {
     private var pipPreview: some View {
         GeometryReader { g in
             let short = min(g.size.width, g.size.height)
-            let side = short * 0.30
+            let side = short * pipSize
             let margin = short * 0.045
             PipPreviewView(image: DualCameraPip.shared.previewImage)
                 .frame(width: side, height: side)
@@ -763,6 +766,28 @@ struct PrompterView: View {
                             }
                         }
                         .tint(T.accent)
+
+                        if pipOn {
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text("小窗大小")
+                                        .font(.system(size: 13))
+                                        .foregroundColor(T.ink2)
+                                    Spacer()
+                                    Text("\(Int((pipSize * 100).rounded()))%")
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundColor(T.accent)
+                                        .monospacedDigit()
+                                }
+                                Slider(value: $pipSize, in: 0.18...0.48, step: 0.01)
+                                    .tint(T.accent)
+                                Text("拖动调节小窗尺寸，取景框和成片会一起变大变小")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(T.sub)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .padding(.top, 4)
+                        }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -771,7 +796,7 @@ struct PrompterView: View {
             }
         }
         .background(T.bg.ignoresSafeArea())
-        .presentationDetents([.height(560)])
+        .presentationDetents([.height(640)])
     }
 
     private var boxSection: some View {

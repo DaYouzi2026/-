@@ -24,7 +24,11 @@ import Combine
 final class DualCameraPip: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, ObservableObject {
 
     static let shared = DualCameraPip()
-    private override init() {}
+    private override init() {
+        // 与界面 @AppStorage 同源（同一 UserDefaults.standard），重启后小窗大小不回退
+        let v = UserDefaults.standard.double(forKey: Pref.pipSize)
+        if v > 0 { _pipSizeRatio = CGFloat(v) }
+    }
 
     /// 副摄视频输出。由 CameraRecorder 加进多摄会话，delegate 指向本类。
     let videoOut = AVCaptureVideoDataOutput()
@@ -40,6 +44,14 @@ final class DualCameraPip: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     /// 副摄最新一帧（独占 buffer 冻结，不参与 AVCapture 复用，合成时不会花屏）
     private var latest: CIImage?
     private var lastFreezeAt: CFTimeInterval = 0
+
+    /// 小窗占画面短边的比例。主线程（设置页滑杆）写，帧队列（composite）读，用 lock 保护。
+    /// 默认 0.30，与界面滑杆默认值一致。
+    private var _pipSizeRatio: CGFloat = 0.30
+    var pipSizeRatio: CGFloat {
+        get { lock.lock(); defer { lock.unlock() }; return _pipSizeRatio }
+        set { lock.lock(); _pipSizeRatio = newValue; lock.unlock() }
+    }
 
     @Published private(set) var available = false
     /// 小窗预览图：直接用冻结帧生成，方向和成片一致，不依赖多摄预览层绑定
@@ -200,7 +212,7 @@ final class DualCameraPip: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
         if let pip = pip, pip.extent.width > 0, pip.extent.height > 0 {
             let short = min(CGFloat(mw), CGFloat(mh))
-            let side = short * 0.30
+            let side = short * pipSizeRatio
             let margin = short * 0.045
             let radius = side * 0.22
 
