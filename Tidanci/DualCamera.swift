@@ -241,7 +241,7 @@ final class DualCameraPip: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         renderCtx.render(out, to: buffer)
 
         // 主帧的 timing 原样复用，PTS 完全对齐（音画不错拍）
-        let timing = CMSampleTimingInfo(duration: CMSampleBufferGetDuration(main),
+        var timing = CMSampleTimingInfo(duration: CMSampleBufferGetDuration(main),
                                         presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(main),
                                         decodeTimeStamp: CMSampleBufferGetDecodeTimeStamp(main))
         var format: CMVideoFormatDescription?
@@ -256,7 +256,7 @@ final class DualCameraPip: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                                                  makeDataReadyCallback: nil,
                                                  refcon: nil,
                                                  formatDescription: fmt,
-                                                 sampleTiming: timing,
+                                                 sampleTiming: &timing,
                                                  sampleBufferOut: &result) == noErr,
               let sb = result else { return nil }
         return sb
