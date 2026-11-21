@@ -191,9 +191,15 @@ final class DualCameraPip: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         let still = CIImage(cvPixelBuffer: buf)
         lock.lock(); latest = still; lock.unlock()
 
-        // 小窗预览直接用这帧（独占 buffer，延迟渲染安全）
-        let ui = UIImage(ciImage: still)
-        DispatchQueue.main.async { self.previewImage = ui }
+        // 小窗预览：必须用 CIContext 立即光栅化成 CGImage 再包 UIImage。
+        // UIImage(ciImage:) 是「延迟渲染」——只揣着 CIImage 引用，等 SwiftUI 显示时才
+        // 由 UIKit 用默认 context 渲染。后台队列创建的 buffer-backed CIImage 跨线程交给
+        // UIKit 时经常渲染成黑屏；而合成走的是显式 renderCtx.render，所以成片正常。
+        // createCGImage 在这里同步出真正的位图，跨线程交给主线程显示就稳定了。
+        if let cg = captureCtx.createCGImage(still, from: still.extent) {
+            let ui = UIImage(cgImage: cg, scale: 1, orientation: .up)
+            DispatchQueue.main.async { self.previewImage = ui }
+        }
     }
 
     // MARK: - 合成
