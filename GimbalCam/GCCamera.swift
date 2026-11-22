@@ -148,8 +148,8 @@ final class GCCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate,
     // MARK: - 变焦 / 对焦 / 闪光灯
     func setZoom(_ factor: CGFloat) {
         guard let dev = videoInput?.device else { return }
-        let max = min(dev.activeFormat.videoMaxZoomFactor, 6.0)
-        let f = max(1.0, min(max, factor))
+        let maxZoomValue = min(dev.activeFormat.videoMaxZoomFactor, 6.0)
+        let f = Swift.max(1.0, Swift.min(maxZoomValue, factor))
         try? dev.lockForConfiguration()
         dev.videoZoomFactor = f
         dev.unlockForConfiguration()

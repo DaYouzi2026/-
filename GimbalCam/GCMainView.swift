@@ -392,7 +392,7 @@ struct GCMainView: View {
             HStack {
                 Button("扫描设备") { ble.scan() }.foregroundColor(.cyan)
                 Spacer()
-                Button("连接状态：\(ble.stateText)").foregroundColor(.gray).font(.caption)
+                Text("连接：\(ble.stateText)").foregroundColor(.gray).font(.caption)
                 Spacer()
                 Button("解锁横竖屏") { follow.manualUnlock() }.foregroundColor(.orange)
             }
