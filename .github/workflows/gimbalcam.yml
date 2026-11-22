@@ -1,0 +1,61 @@
+name: build-gimbalcam-ios
+
+# 云台控制 + 提词 App（iOS 版）独立编译
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v4
+
+      - name: 装 XcodeGen
+        run: |
+          brew install xcodegen || brew upgrade xcodegen
+          xcodegen --version
+
+      - name: 生成 Xcode 工程
+        run: |
+          xcodegen generate
+          PBX=Tidanci.xcodeproj/project.pbxproj
+          if [ -f "$PBX" ] && grep -q "objectVersion = 77;" "$PBX"; then
+            sed -i '' 's/objectVersion = 77;/objectVersion = 56;/' "$PBX"
+            sed -i '' '/preferredProjectObjectVersion/d' "$PBX"
+          fi
+          xcodebuild -version
+          xcodebuild -list -project Tidanci.xcodeproj
+
+      - name: 编译 GimbalCam
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Tidanci.xcodeproj \
+            -target GimbalCam \
+            -configuration Release \
+            -sdk iphoneos \
+            CONFIGURATION_BUILD_DIR="$PWD/out_gimbalcam" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: 打包成 ipa
+        run: |
+          APP="out_gimbalcam/GimbalCam.app"
+          test -d "$APP" || { echo "没有产物，编译失败"; ls -R out_gimbalcam || true; exit 1; }
+          rm -rf Payload GimbalCam.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry GimbalCam.ipa Payload
+          ls -lh GimbalCam.ipa
+
+      - name: 上传安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: GimbalCam-ipa
+          path: GimbalCam.ipa
+          if-no-files-found: error
