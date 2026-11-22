@@ -265,17 +265,22 @@ struct GCMainView: View {
                 Spacer()
             }
             if showDiagnostics {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("已知设备: \(ble.lastConnectedName)").foregroundColor(.cyan)
-                        ForEach(ble.logs, id: \.self) { l in
-                            Text(l).font(.system(size: 9, design: .monospaced)).foregroundColor(.green)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("说明：若系统蓝牙已连云台(HID拍照)，App 通常扫不到它的控制通道。")
+                        .font(.system(size: 9)).foregroundColor(.yellow)
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("状态: \(ble.stateText)").foregroundColor(.cyan)
+                                .font(.system(size: 9, design: .monospaced))
+                            ForEach(ble.logs, id: \.self) { l in
+                                Text(l).font(.system(size: 9, design: .monospaced)).foregroundColor(.green)
+                            }
+                            Text(ble.diagnostics)
+                                .font(.system(size: 9, design: .monospaced)).foregroundColor(.white)
                         }
-                        Text(ble.diagnostics)
-                            .font(.system(size: 9, design: .monospaced)).foregroundColor(.white)
                     }
+                    .frame(maxHeight: 120)
                 }
-                .frame(maxHeight: 130)
             }
         }
         .padding(12)

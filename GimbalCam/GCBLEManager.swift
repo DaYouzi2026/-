@@ -1,18 +1,21 @@
 import Foundation
 import CoreBluetooth
 
-/// CoreBluetooth 云台连接。
-/// 改进：扫描全部设备（含无名称的），按信号排序；连接后发现「全部」服务与特征，
-/// 自动挑选可写特征作为控制通道，并把发现结果暴露给界面做诊断。
+/// CoreBluetooth 云台连接（增强版）
+/// - 云台通常广播两个 BLE 身份：HID 拍照键（被 iOS 系统占用，App 扫不到）
+///   与 GATT 控制通道（FE00/02F00000 服务，用于转头）。本类寻找后者。
+/// - 扫描时记录广播的服务 UUID，即使设备无名称也能按服务识别。
+/// - 自动连接只尝试「候选设备」，连上后验证服务，验证失败自动断开换下一个。
 final class GCBLEManager: NSObject, ObservableObject,
                           CBCentralManagerDelegate, CBPeripheralDelegate {
 
     @Published var stateText = "初始化…"
     @Published var devices: [CBPeripheral] = []
     @Published var deviceRSSI: [UUID: Int] = [:]
+    @Published var deviceUUIDs: [UUID: [String]] = [:]
     @Published var logs: [String] = []
     @Published var connected = false
-    @Published var diagnostics = ""          // 发现到的服务/特征，供排查
+    @Published var diagnostics = ""
     @Published var lastConnectedName = ""
 
     private var central: CBCentralManager!
@@ -20,11 +23,16 @@ final class GCBLEManager: NSObject, ObservableObject,
     private var writeChar: CBCharacteristic?
     private var allWriteChars: [CBCharacteristic] = []
     private var allNotifyChars: [CBCharacteristic] = []
-    private var autoConnectAttempted = false
 
-    /// 已知写特征优先级（命中则用，否则退回任意可写特征）
-    private let knownWrite = ["FF01", "FFE1", "FFF1", "02F00000-0000-0000-0000-00000000FF01"]
-    private let knownNotify = ["FF02", "FFE2", "FFF2", "02F00000-0000-0000-0000-00000000FF02"]
+    private var autoQueue: [CBPeripheral] = []      // 待尝试的候选
+    private var autoIndex = 0
+    private var connectTimer: Timer?
+    private var verifiedService = false
+
+    private let knownWrite = ["FF01", "FFE1", "FFF1", "02F00000-0000-0000-0000-00000000FF01",
+                              "0000ff01-0000-1000-8000-00805f9b34fb"]
+    private let knownNotify = ["FF02", "FFE2", "FFF2", "02F00000-0000-0000-0000-00000000FF02",
+                               "0000ff02-0000-1000-8000-00805f9b34fb"]
 
     override init() {
         super.init()
@@ -46,35 +54,55 @@ final class GCBLEManager: NSObject, ObservableObject,
     func scan() {
         guard central.state == .poweredOn else { return }
         stateText = "扫描中…"
+        clearConnectTimer()
         devices.removeAll()
         deviceRSSI.removeAll()
-        autoConnectAttempted = false
+        deviceUUIDs.removeAll()
+        autoQueue.removeAll()
+        autoIndex = 0
         central.scanForPeripherals(withServices: nil,
                                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
         DispatchQueue.main.asyncAfter(deadline: .now() + 9) { [weak self] in
             guard let self = self else { return }
             self.central.stopScan()
-            if !self.connected {
-                self.stateText = "扫描结束 · 点设备连接"
-                self.autoConnectGimbal()
-            }
+            if !self.connected { self.autoConnectGimbal() }
+            self.refreshDiagnostics()
         }
     }
 
     func centralManager(_ c: CBCentralManager, didDiscover p: CBPeripheral,
                         advertisementData: [String: Any], rssi RSSI: NSNumber) {
         deviceRSSI[p.identifier] = RSSI.intValue
+        let uuids = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID])?
+            .map { $0.uuidString } ?? []
+        if !uuids.isEmpty { deviceUUIDs[p.identifier] = uuids }
         if !devices.contains(where: { $0.identifier == p.identifier }) {
             devices.append(p)
-            // 按顺序排序：云台名优先，其次信号强
             devices.sort { a, b in
-                let ag = isGimbalName(a.name ?? "")
-                let bg = isGimbalName(b.name ?? "")
-                if ag != bg { return ag }
+                let ac = isCandidate(a), bc = isCandidate(b)
+                if ac != bc { return ac }
                 return (deviceRSSI[a.identifier] ?? -100) > (deviceRSSI[b.identifier] ?? -100)
             }
         }
+        refreshDiagnostics()
     }
+
+    /// 候选优先级：名字像云台(3) > 广播了控制服务UUID(2) > 强信号的未命名设备(1) > 其他(0)
+    private func candidateScore(_ p: CBPeripheral) -> Int {
+        if isGimbalName(p.name ?? "") { return 3 }
+        if let uuids = deviceUUIDs[p.identifier] {
+            for u in uuids {
+                let s = u.uppercased()
+                if s.contains("FE00") || s.contains("02F00000")
+                    || s.contains("FFE0") || s.contains("FFF0") { return 2 }
+            }
+        }
+        // 无名称 + 信号较强：很可能是云台控制通道（不广播名字很常见）
+        if p.name == nil && (deviceRSSI[p.identifier] ?? -100) > -80 { return 1 }
+        return 0
+    }
+
+    private func isCandidate(_ p: CBPeripheral) -> Bool { candidateScore(p) > 0 }
 
     private func isGimbalName(_ n: String) -> Bool {
         let s = n.lowercased()
@@ -83,72 +111,125 @@ final class GCBLEManager: NSObject, ObservableObject,
     }
 
     func deviceLabel(_ p: CBPeripheral) -> String {
-        let name = p.name ?? "未命名设备"
+        let name = p.name ?? "未命名"
         let r = deviceRSSI[p.identifier].map { "\($0)dBm" } ?? "?"
-        let tag = isGimbalName(name) ? " ★云台" : ""
-        return "\(name)  \(r)\(tag)"
+        let tag = isCandidate(p) ? " ★候选" : ""
+        return "\(name) \(r)\(tag)"
     }
 
-    /// 自动连接信号最强的云台设备
+    func deviceDetail(_ p: CBPeripheral) -> String {
+        let name = p.name ?? "未命名"
+        let r = deviceRSSI[p.identifier].map { "\($0)" } ?? "?"
+        let uuids = deviceUUIDs[p.identifier]?.joined(separator: ",") ?? "无广播UUID"
+        return "\(name) | \(r)dBm | \(isCandidate(p) ? "候选" : "其他") | \(uuids)"
+    }
+
+    /// 自动连接：只对候选设备逐个尝试，连上验证服务失败则断开换下一个
     func autoConnectGimbal() {
-        guard !autoConnectAttempted else { return }
-        autoConnectAttempted = true
-        let gimbals = devices.filter { isGimbalName($0.name ?? "") }
-        let target = (gimbals.isEmpty ? devices : gimbals)
-            .max { (deviceRSSI[$0.identifier] ?? -100) < (deviceRSSI[$1.identifier] ?? -100) }
-        if let p = target {
-            addLog("自动连接: \(p.name ?? "未命名")")
-            connect(p)
+        autoQueue = devices.filter { candidateScore($0) > 0 }
+            .sorted { a, b in
+                let sa = candidateScore(a), sb = candidateScore(b)
+                if sa != sb { return sa > sb }
+                return (deviceRSSI[a.identifier] ?? -100) > (deviceRSSI[b.identifier] ?? -100)
+            }
+        autoIndex = 0
+        if autoQueue.isEmpty {
+            stateText = "未发现云台 · 请确认云台已开机"
+            addLog("扫描到的设备均非云台候选")
+            refreshDiagnostics()
+            return
         }
+        addLog("候选 \(autoQueue.count) 个，开始尝试")
+        tryNextCandidate()
+    }
+
+    private func tryNextCandidate() {
+        guard autoIndex < autoQueue.count else {
+            stateText = "候选均连接失败 · 需用 Gimbal Play 确认型号"
+            addLog("所有候选设备均未发现控制服务")
+            refreshDiagnostics()
+            return
+        }
+        let p = autoQueue[autoIndex]
+        autoIndex += 1
+        connect(p)
     }
 
     // MARK: - 连接
     func connect(_ p: CBPeripheral) {
+        clearConnectTimer()
         stateText = "连接中… \(p.name ?? "未命名")"
         lastConnectedName = p.name ?? "未命名设备"
         peripheral = p
         p.delegate = self
         central.connect(p, options: nil)
+        // 连接+发现服务超时：8 秒没验证到就换下一个
+        connectTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            if !self.verifiedService {
+                self.addLog("超时无控制服务，换下一个")
+                self.central.cancelPeripheralConnection(p)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.tryNextCandidate() }
+            }
+        }
+    }
+
+    private func clearConnectTimer() {
+        connectTimer?.invalidate()
+        connectTimer = nil
     }
 
     func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
-        stateText = "已连接 · 发现服务…"
-        addLog("已连接 \(p.name ?? "")")
+        stateText = "已连接 · 验证服务…"
+        addLog("已连接 \(p.name ?? "未命名")")
+        verifiedService = false
         allWriteChars.removeAll()
         allNotifyChars.removeAll()
-        diagnostics = "发现服务中…"
-        // 关键：不再限定 UUID，发现全部服务，避免不同固件 UUID 不一致导致读不到
         p.discoverServices(nil)
     }
 
     func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
-        stateText = "连接失败（设备可能已被系统占用为HID）"
+        clearConnectTimer()
+        stateText = "连接失败 · 换下一个"
         addLog("连接失败: \(error?.localizedDescription ?? "未知")")
+        tryNextCandidate()
     }
 
     func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
-        connected = false
-        stateText = "已断开 · 可重新扫描"
-        addLog("已断开")
+        clearConnectTimer()
+        if connected {
+            connected = false
+            stateText = "已断开 · 可重新扫描"
+            addLog("已断开")
+        }
     }
 
     // MARK: - 服务 / 特征发现
     func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
-        guard let services = p.services else {
-            diagnostics = "未发现任何服务（该设备可能只有 HID 拍照功能，无 GATT 控制通道）"
-            stateText = "设备无控制服务"
+        guard let services = p.services else { return }
+        addLog("发现 \(services.count) 个服务")
+        let hasControl = services.contains { s in
+            let u = s.uuid.uuidString.uppercased()
+            return u.contains("FE00") || u.contains("02F00000")
+        }
+        if hasControl {
+            verifiedService = true
+            clearConnectTimer()
+            stateText = "云台已连接 ✓"
+            connected = true
+            addLog("✓ 找到控制服务")
+        } else {
+            // 连上的不是云台控制通道，断开换下一个
+            addLog("非云台控制服务，断开")
+            refreshDiagnostics(services: services.map { $0.uuid.uuidString })
+            central.cancelPeripheralConnection(p)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.tryNextCandidate()
+            }
             return
         }
-        var lines: [String] = []
-        if services.isEmpty {
-            lines.append("未发现任何服务")
-        }
-        for s in services {
-            lines.append("服务 \(s.uuid.uuidString)")
-            p.discoverCharacteristics(nil, for: s)
-        }
-        diagnostics = lines.joined(separator: "\n")
-        addLog("发现 \(services.count) 个服务")
+        for s in services { p.discoverCharacteristics(nil, for: s) }
+        refreshDiagnostics(services: services.map { $0.uuid.uuidString })
     }
 
     func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor s: CBService, error: Error?) {
@@ -188,7 +269,7 @@ final class GCBLEManager: NSObject, ObservableObject,
         else { return }
         writeChar = best
         connected = true
-        stateText = "已就绪 ✓"
+        stateText = "云台已连接 ✓"
         addLog("控制通道: \(best.uuid.uuidString)")
         for ch in allNotifyChars.sorted(by: { rank($0, knownNotify) > rank($1, knownNotify) }) {
             peripheral?.setNotifyValue(true, for: ch)
@@ -225,10 +306,22 @@ final class GCBLEManager: NSObject, ObservableObject,
 
     private func addLog(_ s: String) {
         logs.insert(s, at: 0)
-        if logs.count > 10 { logs.removeLast() }
+        if logs.count > 14 { logs.removeLast() }
+    }
+
+    private func refreshDiagnostics(services: [String]? = nil) {
+        var lines: [String] = []
+        lines.append("扫描到 \(devices.count) 个设备：")
+        for p in devices { lines.append(deviceDetail(p)) }
+        if let svcs = services {
+            lines.append("已连接设备服务：")
+            lines.append(contentsOf: svcs)
+        }
+        diagnostics = lines.joined(separator: "\n")
     }
 
     func disconnect() {
+        clearConnectTimer()
         if let p = peripheral { central.cancelPeripheralConnection(p) }
         connected = false
     }
