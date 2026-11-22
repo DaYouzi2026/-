@@ -53,6 +53,12 @@ public class BleController {
         this.ctx = ctx;
         this.listener = listener;
         this.adapter = BluetoothAdapter.getDefaultAdapter();
+        final Listener L = listener;
+        this.leScanCallback = (device, rssi, scanRecord) -> {
+            if (device.getName() != null) {
+                main.post(() -> L.onDevices(java.util.Collections.singletonList(device)));
+            }
+        };
     }
 
     public boolean bluetoothAvailable() { return adapter != null && adapter.isEnabled(); }
@@ -68,12 +74,7 @@ public class BleController {
         }, 8000);
     }
 
-    private final BluetoothAdapter.LeScanCallback leScanCallback = (device, rssi, scanRecord) -> {
-        // 只显示有名字的设备（云台通常有名字）
-        if (device.getName() != null) {
-            main.post(() -> listener.onDevices(java.util.Collections.singletonList(device)));
-        }
-    };
+    private final BluetoothAdapter.LeScanCallback leScanCallback;
 
     public void connect(BluetoothDevice device) {
         listener.onState("连接中… " + device.getName());
