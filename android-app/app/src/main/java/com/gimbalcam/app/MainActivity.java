@@ -63,7 +63,6 @@ public class MainActivity extends AppCompatActivity {
         });
         faceDetector = FaceDetection.getClient(new FaceDetectorOptions.Builder()
                 .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
-                .setTrackingEnabled(true)
                 .build());
         cameraExecutor = Executors.newSingleThreadExecutor();
         if (allPerms()) { startCamera(); ble.scan(); }
