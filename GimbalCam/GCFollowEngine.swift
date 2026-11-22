@@ -14,13 +14,13 @@ final class GCFollowEngine: ObservableObject {
     private var lastYaw: Float = 0, lastPitch: Float = 0
 
     func compute(dx: Float, dy: Float) -> (Int, Int)? {
-        guard enabled else { lastYaw = lastPitch = 0; return nil }
+        guard enabled else { lastYaw = 0; lastPitch = 0; return nil }
         var x = invertX ? -dx : dx
         var y = invertY ? -dy : dy
 
         if abs(x) < deadzone { x = 0 }
         if abs(y) < deadzone { y = 0 }
-        if x == 0 && y == 0 { lastYaw = lastPitch = 0; return nil }
+        if x == 0 && y == 0 { lastYaw = 0; lastPitch = 0; return nil }
 
         let ty = sign(x) * pow(abs(x), 0.75) * gain * 1000
         let tp = sign(y) * pow(abs(y), 0.75) * gain * 1000
@@ -34,7 +34,7 @@ final class GCFollowEngine: ObservableObject {
     }
 
     private func sign(_ v: Float) -> Float { v >= 0 ? 1 : -1 }
-    func reset() { lastYaw = lastPitch = 0 }
+    func reset() { lastYaw = 0; lastPitch = 0 }
 
     // 横竖屏锁定（防抖滞回）
     private(set) var orientationLocked = false

@@ -148,8 +148,8 @@ struct GCMainView: View {
                 Toggle("俯仰反转", isOn: $follow.invertY).foregroundColor(.white)
 
                 Text("提词设置").font(.headline).foregroundColor(.white).padding(.top)
-                sliderRow("速度", value: $speed, range: 0.2...6.0)
-                sliderRow("字号", value: $fontSize, range: 16...60)
+                sliderCGFloat("速度", value: $speed, range: 0.2...6.0)
+                sliderCGFloat("字号", value: $fontSize, range: 16...60)
                 Toggle("镜像", isOn: $mirrored).foregroundColor(.white)
                 Toggle("边框", isOn: $showBorder).foregroundColor(.white)
 
@@ -180,6 +180,16 @@ struct GCMainView: View {
             HStack { Text(title).foregroundColor(.white).font(.caption)
                 Spacer()
                 Text(String(format: "%.2f", value.wrappedValue)).foregroundColor(.gray).font(.caption)
+            }
+            Slider(value: value, in: range)
+        }
+    }
+
+    private func sliderCGFloat(_ title: String, value: Binding<CGFloat>, range: ClosedRange<CGFloat>) -> some View {
+        VStack(alignment: .leading) {
+            HStack { Text(title).foregroundColor(.white).font(.caption)
+                Spacer()
+                Text(String(format: "%.1f", value.wrappedValue)).foregroundColor(.gray).font(.caption)
             }
             Slider(value: value, in: range)
         }

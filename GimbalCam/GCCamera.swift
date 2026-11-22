@@ -20,7 +20,7 @@ final class GCCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     }
 
     private func setupVision() {
-        let req = VNSequenceFaceDetectionRequest { request, error in
+        let req = VNDetectFaceRectanglesRequest { request, error in
             guard let results = request.results as? [VNFaceObservation],
                   let face = results.first else { return }
             let b = face.boundingBox
