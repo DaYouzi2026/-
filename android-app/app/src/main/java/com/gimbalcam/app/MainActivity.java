@@ -115,7 +115,7 @@ public class MainActivity extends AppCompatActivity {
             prompter.setVisibility(showPrompter ? View.VISIBLE : View.GONE);
         }));
         top.addView(btn("播放", v -> prompter.setPlaying(!prompter.isPlaying())));
-        top.addView(btn("设置", v -> toggleSettings());
+        top.addView(btn("设置", v -> toggleSettings()));
         FrameLayout.LayoutParams topLp = new FrameLayout.LayoutParams(-1, -2);
         topLp.gravity = android.view.Gravity.TOP;
         root.addView(top, topLp);
