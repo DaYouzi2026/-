@@ -20,11 +20,7 @@ final class GCVolumeShutter: NSObject {
         guard !started else { return }
         started = true
 
-        do {
-            try AVAudioSession.sharedInstance().setCategory(.ambient)
-            try AVAudioSession.sharedInstance().setActive(true)
-        } catch { /* 忽略：不影响监听 */ }
-
+        // 不改音频会话分类，避免干扰录像的声音采集；只观察系统音量即可
         centerVolume()
 
         // 音量键：观察系统输出音量变化
