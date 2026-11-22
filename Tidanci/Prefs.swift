@@ -21,6 +21,8 @@ enum Pref {
     static let mirrorSave = "p.mirrorSave"
     /// 视频防抖档位：0 关 / 1 标准 / 2 电影级（存 Int，见 Stabilization）
     static let stabilization = "p.stabilization"
+    /// 变焦倍数（Double，1.0 起）
+    static let zoom = "p.zoom"
     /// 前后同拍（画中画）：主画面 + 另一颗镜头小窗录进同一条视频，仅原相机模式生效
     static let pip = "p.pip"
     /// 同拍小窗大小：占画面短边的比例（Double，0.18~0.48，默认 0.30）

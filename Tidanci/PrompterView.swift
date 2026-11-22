@@ -209,6 +209,8 @@ struct PrompterView: View {
     @AppStorage(Pref.mirrorSave) private var mirrorSave = true
     /// 视频防抖档位（0 关 / 1 标准 / 2 电影级）
     @AppStorage(Pref.stabilization) private var stabilization = 1
+    /// 变焦倍数
+    @AppStorage(Pref.zoom) private var zoom = 1.0
     /// 前后同拍（画中画），仅原相机模式生效
     @AppStorage(Pref.pip) private var pipOn = false
     /// 同拍小窗大小（占画面短边比例）
@@ -315,6 +317,7 @@ struct PrompterView: View {
         .onChange(of: fpsSetting) { _ in applyQuality() }
         .onChange(of: mirrorSave) { v in cam.setMirrorSave(v) }
         .onChange(of: stabilization) { v in cam.setStabilization(v) }
+        .onChange(of: zoom) { v in cam.setZoom(CGFloat(v)) }
         .onChange(of: beautyOn) { v in switchMode(v) }
         .onChange(of: pipOn) { v in applyPip(v) }
         .onChange(of: pipSize) { v in DualCameraPip.shared.pipSizeRatio = v }
@@ -349,7 +352,10 @@ struct PrompterView: View {
                 if cam.mode == .beauty {
                     FilterPreview()
                 } else {
+                    // .id 绑定 sessionGeneration：同拍开关换会话对象后强制重建预览层，
+                    // 否则 UIViewRepresentable 不会重新绑定新的 session，取景会黑掉。
                     CameraPreview(session: cam.session, mirrored: cam.isFront && mirrorSave)
+                        .id(cam.sessionGeneration)
                     // 前后同拍：右上角叠一个副摄取景小窗，和成片里的位置一致
                     if pipOn && cam.pipActive && cam.mode == .native {
                         pipPreview
@@ -505,17 +511,25 @@ struct PrompterView: View {
                 pill(cam.presetText, mono: true)
 
                 // 防抖胶囊常显（含「防抖·关」），点一下在 关→标准→电影级 之间循环。
-                // 4K60 上电影级会被降档，胶囊显示的是实际生效的档位。
+                // 同拍的多摄会话下 iPhone 不支持防抖，胶囊会显示「同拍时不可用」。
                 pill(cam.stabilText)
                     .onTapGesture {
                         guard !cam.recording else {
                             showTip("录制中不能换防抖，停了再换")
                             return
                         }
+                        if pipOn && cam.pipActive {
+                            showTip("前后同拍时 iPhone 不支持电子防抖，关掉同拍即可用")
+                            return
+                        }
                         Haptics.tap()
                         stabilization = (stabilization + 1) % 3
                     }
                     .accessibilityLabel(cam.stabilText + "，点按切换防抖档位")
+
+                // 变焦档位：1× / 2× / 3×（按设备上限收敛），点一下切换。
+                // 显示当前 cam.zoomText（真正落到设备上的值），和 AppStorage 的意图值区分开。
+                zoomControl
 
                 if cam.recording {
                     HStack(spacing: 5) {
@@ -620,6 +634,36 @@ struct PrompterView: View {
         .pressable()
         .accessibilityLabel(label)
         .accessibilityAddTraits(active ? .isSelected : [])
+    }
+
+    /// 变焦档位控件：显示当前落到设备的倍数，点一下在 1×→2×→3× 间循环，
+    /// 上限取设备上报的 zoomMax（iPhone 13 主摄通常 6×，这里只给到 3× 够用且画质可控）。
+    private var zoomControl: some View {
+        let levels: [Double] = [1.0, 2.0, 3.0].filter { $0 <= Double(cam.zoomMax) + 0.01 }
+        return Button {
+            guard !cam.recording else {
+                showTip("录制中不能调变焦，停了再调")
+                return
+            }
+            Haptics.tap()
+            let opts = levels.isEmpty ? [1.0] : levels
+            // 找当前意图值在档位里的位置，循环到下一档
+            let idx = opts.firstIndex { abs($0 - zoom) < 0.05 } ?? (opts.count - 1)
+            zoom = opts[(idx + 1) % opts.count]
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "plus.magnifyingglass")
+                    .font(.system(size: 10, weight: .semibold))
+                Text(cam.zoomText)
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+            }
+            .foregroundColor(.white.opacity(0.92))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(Color.black.opacity(0.48))
+            .clipShape(Capsule())
+        }
+        .accessibilityLabel("变焦 " + cam.zoomText + "，点按切换档位")
     }
 
     private func pill(_ text: String, mono: Bool = false) -> some View {
@@ -947,6 +991,8 @@ struct PrompterView: View {
             // 防抖要在 start 之前给：setStabilization 和 start 都排在 cfgQ 上，
             // 先来的先执行，configure() 建连接时就能一次落到位。
             cam.setStabilization(stabilization)
+            // 变焦档位恢复：setZoom 排在 cfgQ 上、先于 start，configure 时就能落到位
+            cam.setZoom(CGFloat(zoom))
             cam.start(front: true,
                       quality: q,
                       fps: fpsSetting,

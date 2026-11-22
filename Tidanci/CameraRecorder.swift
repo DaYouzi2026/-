@@ -42,7 +42,14 @@ final class CameraRecorder: NSObject, ObservableObject {
     /// v1.28：改用多摄会话。前后同拍时主摄 + 副摄挂在**同一个**会话上同时采，
     /// 彻底避免"两个独立 AVCaptureSession 互相抢摄像头"导致的黑屏 / 定屏。
     /// AVCaptureMultiCamSession 是 AVCaptureSession 子类，单摄路径行为一致。
-    let session = AVCaptureMultiCamSession()
+    /// 采集会话按「是否同拍」动态切换：
+    /// · 不开同拍 → 普通 AVCaptureSession（单摄）：电子防抖可用、画质可到 4K、
+    ///   预览层只有一路视频输入，自动选路就是主摄，取景和成片一致。
+    /// · 开同拍 → AVCaptureMultiCamSession（两路）：代价是 iPhone 不支持电子防抖。
+    /// AVCaptureMultiCamSession 是 AVCaptureSession 子类，所有配置 API 通用。
+    private(set) var session: AVCaptureSession = AVCaptureSession()
+    /// 会话对象被换掉时递增（主线程），触发 SwiftUI 重建预览层重新绑定。
+    @Published private(set) var sessionGeneration = 0
 
     /// v1.27：native 与 beauty 都走 AVAssetWriter，native 用它把音视频写进同一个 mp4。
     private let movie = MovieWriter()
@@ -75,6 +82,8 @@ final class CameraRecorder: NSObject, ObservableObject {
     private var mirrorSaveFlag = true
     /// 防抖档位（0 关 / 1 标准 / 2 电影级）。用户意图，实际生效的档位会降级后发到 stabilText
     private var stabilizationFlag = 1
+    /// 变焦倍数（用户意图，cfgQ 上）。换会话/换设备后据此重新落地。
+    private var zoomWanted: CGFloat = 1
     /// 前后同拍用户意图。只在 native 模式生效；beauty 模式由界面强制切回。
     private var pipWanted = false
 
@@ -179,6 +188,10 @@ final class CameraRecorder: NSObject, ObservableObject {
     @Published private(set) var mode: Mode = .native
     /// 前后同拍是否真的在生效（副摄会话起来了）。界面据此显示小窗取景与状态。
     @Published private(set) var pipActive = false
+    /// 变焦档位文字，比如 "1.0×" / "2.0×"，拍摄页胶囊直接显示它
+    @Published private(set) var zoomText = "1.0×"
+    /// 当前设备支持的变焦上限（档位按钮据此决定显示几个）
+    @Published private(set) var zoomMax: CGFloat = 3
     @Published private(set) var recordingError = ""
 
     var onAudio: ((AVAudioPCMBuffer) -> Void)?
@@ -331,14 +344,15 @@ final class CameraRecorder: NSObject, ObservableObject {
         pipWanted = on
         cfgQ.async {
             guard !self.nativeRecording else { return }
-            self.session.beginConfiguration()
-            if on {
-                // 副摄拍「主路的反面」：主路前置拍人，副摄后置拍场景；反之亦然
-                self.attachPipLocked(front: !self.frontFlag)
-            } else {
-                self.detachPipLocked()
+            // 同拍开关会改变会话类型（单摄↔多摄）。换会话会清空所有 input/output，
+            // 所以无论是否跨类型，都整段重配一次最稳妥：configure 内部会按需建/拆副摄。
+            let wasMulti = self.session is AVCaptureMultiCamSession
+            self.configure(front: self.frontFlag)
+            let nowMulti = self.session is AVCaptureMultiCamSession
+            // 换了会话对象后必须重新 startRunning，否则新会话没有画面
+            if wasMulti != nowMulti, !self.session.isRunning {
+                self.session.startRunning()
             }
-            self.session.commitConfiguration()
         }
         videoQ.async { self.pipOnV = on }
         // pipActive 反映用户意图，界面据此立即显示小窗取景层，不因会话异步建立而闪烁
@@ -354,6 +368,49 @@ final class CameraRecorder: NSObject, ObservableObject {
             c.automaticallyAdjustsVideoMirroring = false
         }
         c.isVideoMirrored = m
+    }
+
+    // MARK: - 变焦
+
+    /// 设置变焦倍数。用户点档位按钮调用；录制中也能调（videoZoomFactor 改的是采集，
+    /// 不影响正在写的帧时序），但为稳妥仍只在非录制时改，避免画面突然跳一下。
+    func setZoom(_ factor: CGFloat) {
+        cfgQ.async {
+            self.zoomWanted = factor
+            self.applyZoom(factor)
+        }
+    }
+
+    /// 把变焦落到主摄设备上，clamp 到 [1, min(设备上限, 6)]，并回写按钮状态。
+    /// 只在 cfgQ 上调用。
+    private func applyZoom(_ wanted: CGFloat) {
+        guard let dev = videoIn?.device else {
+            // 设备还没就绪，先把文字记下来，等 configure 里 applyZoom 再补落地
+            let f = min(max(1, wanted), 6)
+            DispatchQueue.main.async {
+                self.zoomText = Self.zoomLabel(f)
+            }
+            return
+        }
+        let maxZ = min(dev.activeFormat.videoMaxZoomFactor, 6)
+        let f = min(max(1, wanted), maxZ)
+        do {
+            try dev.lockForConfiguration()
+            dev.videoZoomFactor = f
+            dev.unlockForConfiguration()
+        } catch {
+            Diag.note("变焦设置失败 \(error.localizedDescription)")
+        }
+        DispatchQueue.main.async {
+            self.zoomText = Self.zoomLabel(dev.videoZoomFactor)
+            self.zoomMax = maxZ
+        }
+    }
+
+    private static func zoomLabel(_ f: CGFloat) -> String {
+        if f < 1.05 { return "1×" }
+        if f - f.rounded() < 0.06 { return "\(Int(f.rounded()))×" }
+        return String(format: "%.1f×", f)
     }
 
     // MARK: - 防抖
@@ -391,7 +448,12 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
 
         guard anyConnection else {
-            DispatchQueue.main.async { self.stabilText = "" }
+            // 没有可用的防抖连接（同拍的多摄会话就是这种）：给个明确文字而不是空串，
+            // 否则拍摄页那个胶囊会变成一块空白，用户点它也没任何反馈，以为坏了。
+            let label = self.pipWanted && self.modeFlag == .native
+                ? "防抖·同拍时不可用"
+                : "防抖·当前不支持"
+            DispatchQueue.main.async { self.stabilText = label }
             return
         }
 
@@ -452,26 +514,36 @@ final class CameraRecorder: NSObject, ObservableObject {
             guard self.modeFlag != m else { return }
             guard !self.nativeRecording else { return }
             self.modeFlag = m
-            // 同拍只在原相机生效：切到美颜关副摄，切回原相机且用户仍想要时重挂。
-            // 注意副摄 input/output 与 configureOutputs 清掉的 output 是同一批，
-            // 所以统一在下面的配置事务里按最新 modeFlag / pipWanted 重挂一次。
-            if m == .beauty {
-                self.videoQ.async { self.pipOnV = false }
-                DispatchQueue.main.async { self.pipActive = false }
+            // 同拍只在原相机生效。切到美颜时会话要从多摄切回单摄（否则防抖/画质回不来）。
+            // 跨会话类型的切换必须整段重配——换会话会清空 input/output，手动那套接不住。
+            let wantMulti = self.pipWanted && m == .native
+            let isMulti = self.session is AVCaptureMultiCamSession
+            let switchingSession = wantMulti != isMulti
+
+            if switchingSession {
+                // configure 会按最新 modeFlag/pipWanted 重建会话、input/output、副摄与格式
+                self.configure(front: self.frontFlag)
+                if !self.session.isRunning { self.session.startRunning() }
+            } else {
+                // 会话类型不变，走原来的局部重配
+                if m == .beauty {
+                    self.videoQ.async { self.pipOnV = false }
+                    DispatchQueue.main.async { self.pipActive = false }
+                }
+                self.session.beginConfiguration()
+                self.syncAudioInputForMode()
+                self.configureOutputs()
+                if m == .native && self.pipWanted {
+                    self.attachPipLocked(front: !self.frontFlag)
+                }
+                if let dev = self.videoIn?.device {
+                    self.applyFormat(dev)
+                    self.applyZoom(self.zoomWanted)
+                    // 刚换了格式（美颜 1080P ↔ 原相机 4K），支持的防抖档位也可能跟着变
+                    self.applyStabilization()
+                }
+                self.session.commitConfiguration()
             }
-            self.session.beginConfiguration()
-            self.syncAudioInputForMode()
-            self.configureOutputs()
-            if m == .native && self.pipWanted {
-                self.attachPipLocked(front: !self.frontFlag)
-            }
-            if let dev = self.videoIn?.device {
-                self.applyFormat(dev)
-                // 刚换了格式（美颜 1080P ↔ 原相机 4K），支持的防抖档位也可能跟着变，
-                // configureOutputs 里那次是按旧格式算的，这里要再落一次
-                self.applyStabilization()
-            }
-            self.session.commitConfiguration()
             self.videoQ.async {
                 self.previewPool = nil
                 self.previewDims = .zero
@@ -518,8 +590,9 @@ final class CameraRecorder: NSObject, ObservableObject {
         observingSession = true
         let c = NotificationCenter.default
 
+        // object: nil —— 会话对象可能因同拍开关被替换，监听所有会话才不会漏掉中断通知
         c.addObserver(forName: .AVCaptureSessionWasInterrupted,
-                      object: session, queue: nil) { [weak self] note in
+                      object: nil, queue: nil) { [weak self] note in
             guard let self else { return }
             let raw = (note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int) ?? -1
             Diag.note("相机会话被中断（\(Self.interruptText(raw))）"
@@ -534,14 +607,14 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
 
         c.addObserver(forName: .AVCaptureSessionInterruptionEnded,
-                      object: session, queue: nil) { [weak self] _ in
+                      object: nil, queue: nil) { [weak self] _ in
             guard let self else { return }
             Diag.note("相机会话中断结束，尝试接着录")
             self.recoverSession(reason: "")
         }
 
         c.addObserver(forName: .AVCaptureSessionRuntimeError,
-                      object: session, queue: nil) { [weak self] note in
+                      object: nil, queue: nil) { [weak self] note in
             guard let self else { return }
             let err = note.userInfo?[AVCaptureSessionErrorKey] as? NSError
             let code = err?.code ?? 0
@@ -595,7 +668,29 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
     }
 
+    /// 确保会话类型与「是否同拍」一致。只在 cfgQ 上调用。
+    /// · 同拍开且原相机 → 多摄会话（两路必须共用会话，否则互抢摄像头）
+    /// · 其余 → 普通单摄会话（防抖可用、预览单路所见即所得、画质可到 4K）
+    /// 只有确实跨类型时才重建：停旧的、清 input/output 引用、换新对象。
+    private func ensureSessionTypeForPip() {
+        let wantMulti = pipWanted && modeFlag == .native
+        let isMulti = session is AVCaptureMultiCamSession
+        guard wantMulti != isMulti else { return }
+
+        if session.isRunning { session.stopRunning() }
+        videoIn = nil
+        audioIn = nil
+        session = wantMulti ? AVCaptureMultiCamSession() : AVCaptureSession()
+        // 换了会话对象，预览层要重新绑定（SwiftUI 靠 sessionGeneration 重建）
+        DispatchQueue.main.async { self.sessionGeneration += 1 }
+        Diag.note(wantMulti ? "同拍：切到多摄会话（此模式 iPhone 不支持防抖）"
+                             : "同拍关闭：切回单摄会话（防抖恢复可用）")
+    }
+
     private func configure(front: Bool) {
+        // 按「是否同拍」确保会话类型正确。只有跨类型（单摄↔多摄）才换对象，
+        // 同类型内的重配（切镜头/换画质）不动会话，避免打断预览。
+        ensureSessionTypeForPip()
         observeSessionIfNeeded()
         AudioSession.forCamera()
 
@@ -634,6 +729,8 @@ final class CameraRecorder: NSObject, ObservableObject {
         }
 
         applyFormat(dev)
+        // 换会话/换设备后 videoZoomFactor 会重置，按用户意图恢复档位
+        applyZoom(zoomWanted)
         configureOutputs()
         // 同拍：把副摄（主路的反面）作为一个额外 input/output 挂进**同一个**多摄会话。
         // 这里必须在配置事务内、主摄 output 加完之后做。失败只影响小窗，主摄照常。
@@ -782,14 +879,13 @@ final class CameraRecorder: NSObject, ObservableObject {
         let side = modeFlag == .beauty ? min(quality.shortSide, 1080) : quality.shortSide
         let targetFps = modeFlag == .beauty ? min(fps, 30) : fps
 
-        // 多摄会话只认 inputPriority：分辨率由每个 input 自己的 activeFormat 决定，
-        // 设 .hd4K3840x2160 这类固定 preset 会被拒甚至让两路采集直接失败。
+        // 多摄会话只认 inputPriority（分辨率由各 input 的 activeFormat 决定）；
+        // 单摄会话也统一走 inputPriority + activeFormat，画质由 bestFormat 选的格式决定，
+        // 这样两种会话的配置路径一致，切换时不用改 preset。
         if session.canSetSessionPreset(.inputPriority) {
             session.sessionPreset = .inputPriority
         }
 
-        // bestFormat 现在只返回 isMultiCamSupported 的格式（见该函数），
-        // 主副摄格式一致，多摄成本预算才算得过来。
         if let f = bestFormat(dev, short: side, fps: targetFps) {
             do {
                 try dev.lockForConfiguration()
@@ -809,11 +905,12 @@ final class CameraRecorder: NSObject, ObservableObject {
         var best: AVCaptureDevice.Format?
         var bestScore = -Double.greatestFiniteMagnitude
 
-        // v1.28：会话改成 AVCaptureMultiCamSession 后，只有 isMultiCamSupported 的格式
-        // 才能加进会话并稳定运行（否则 addInput 会被拒、startRunning 直接失败）。
-        // 单摄时也走这个格式集——画质上限会比纯 4K 低一点，这是两摄可同时工作的前提，
-        // Apple 系统相机的"双摄视频"同样降质。口播场景 1080p 足够。
-        for f in dev.formats where f.isMultiCamSupported {
+        // 多摄会话只能用 isMultiCamSupported 的格式（否则 addInput 被拒、startRunning 失败），
+        // 画质上限会降到 1080p 级——这是两摄同时工作的前提。
+        // 单摄会话不受此限：放开全部格式，4K 和更全的防抖档位都可用。
+        let multi = session is AVCaptureMultiCamSession
+        for f in dev.formats {
+            if multi && !f.isMultiCamSupported { continue }
             let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
             let s = CGFloat(min(d.width, d.height))
             let l = CGFloat(max(d.width, d.height))
@@ -831,8 +928,10 @@ final class CameraRecorder: NSObject, ObservableObject {
                 best = f
             }
         }
-        // 目标分辨率没有任何多摄格式匹配时，退到任意多摄格式，绝不用非多摄格式
-        if best == nil { best = dev.formats.first { $0.isMultiCamSupported } }
+        // 兜底同样按会话类型：多摄只用多摄格式，单摄可退到任意格式
+        if best == nil {
+            best = multi ? dev.formats.first { $0.isMultiCamSupported } : dev.formats.first
+        }
         return best
     }
 
