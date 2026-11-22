@@ -17,6 +17,10 @@ final class GCBLEManager: NSObject, ObservableObject,
     @Published var connected = false
     @Published var diagnostics = ""
     @Published var lastConnectedName = ""
+    @Published var lastButtonEvent = ""
+
+    /// 云台物理按键事件回调（来自 FF02 通知）：0=拍照 1=录像 2=放大 3=缩小 4=停止缩放 5=人脸跟踪切换
+    var onButton: ((Int) -> Void)?
 
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
@@ -277,7 +281,70 @@ final class GCBLEManager: NSObject, ObservableObject,
     }
 
     func peripheral(_ p: CBPeripheral, didUpdateValueFor c: CBCharacteristic, error: Error?) {
-        if let v = c.value { addLog("← " + GCProtocol.hex([UInt8](v))) }
+        guard let v = c.value else { return }
+        let bytes = [UInt8](v)
+        addLog("← " + GCProtocol.hex(bytes))
+        parseButtonNotify(bytes)
+    }
+
+    /// 解析云台 FF02 通知里的物理按键事件。
+    /// 逆向 Gimbal Play: 通知帧与下发同构 FF FF [lenH][lenL][ch][内层帧][crc]，
+    /// 内层帧第 4 字节是命令码；按键事件命令码走 command 分发。
+    /// l70 事件枚举值：TakePicture=2, TakeVideo=3, TakePictureOrVideo=4,
+    /// ZoomIn=9, ZoomOut=10, ZoomIn2=11, ZoomOut2=12, StopZoom=13, FaceTraceToggle=17。
+    private func parseButtonNotify(_ b: [UInt8]) {
+        // 找到 FF FF 头
+        var start = -1
+        for i in 0..<max(0, b.count - 1) where b[i] == 0xFF && b[i+1] == 0xFF {
+            start = i; break
+        }
+        let frame = start >= 0 ? Array(b[start...]) : b
+        // 内层帧格式: 55 02 0B CMD n n [payload] checksum
+        // 找到 0x55 起点
+        var inner = -1
+        for i in 0..<max(0, frame.count - 4) where frame[i] == 0x55 && frame[i+1] == 0x02 {
+            inner = i; break
+        }
+        guard inner >= 0, inner + 4 < frame.count else { return }
+        let cmd = frame[inner + 3]
+        let payload: [UInt8] = inner + 6 <= frame.count - 1
+            ? Array(frame[(inner+6)..<(frame.count-1)]) : []
+
+        var event: Int? = nil
+        switch cmd {
+        case 0x22: // 开关/拍照类
+            if let p0 = payload.first {
+                switch p0 {
+                case 2: event = 0       // TakePicture 拍照
+                case 3: event = 1       // TakeVideo 录像
+                case 4: event = 5       // 拍照或录像
+                case 9: event = 2       // ZoomIn 放大
+                case 10: event = 3      // ZoomOut 缩小
+                case 11: event = 2      // 连续放大
+                case 12: event = 3      // 连续缩小
+                case 13: event = 4      // StopZoom
+                case 17: event = 6      // FaceTraceToggle
+                default: break
+                }
+            }
+        case 0x31: // 模式变化
+            if let p0 = payload.first {
+                switch p0 {
+                case 2: event = 0
+                case 3: event = 1
+                case 9: event = 2
+                case 10: event = 3
+                default: break
+                }
+            }
+        default: break
+        }
+        if let e = event {
+            let names = ["拍照", "录像", "放大", "缩小", "停止缩放", "拍照/录像", "人脸跟踪切换"]
+            lastButtonEvent = names[e]
+            addLog("★按键: \(names[e])")
+            onButton?(e)
+        }
     }
 
     // MARK: - 发指令

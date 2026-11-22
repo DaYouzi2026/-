@@ -152,8 +152,12 @@ struct GCMainView: View {
         .statusBar(hidden: true)
         .onAppear {
             setupCamera()
-            volumeShutter.onShutter = { shoot() }
+            volumeShutter.onShutter = {
+                flashToast("收到拍照键 · \(mode == .photo ? "拍照" : "录像")")
+                shoot()
+            }
             volumeShutter.start()
+            ble.onButton = { event in handleGimbalButton(event) }
         }
         .onDisappear { camera?.stop(); ble.disconnect(); volumeShutter.stop() }
     }
@@ -383,6 +387,33 @@ struct GCMainView: View {
             camera?.takePhoto()
         } else {
             camera?.toggleRecording()
+        }
+    }
+
+    /// 云台物理按键触发的动作（来自 FF02 通知解码）
+    private func handleGimbalButton(_ event: Int) {
+        switch event {
+        case 0: // 拍照
+            mode = .photo
+            camera?.takePhoto()
+        case 1: // 录像
+            mode = .video
+            camera?.toggleRecording()
+        case 5: // 拍照或录像：按当前模式
+            shoot()
+        case 2: // 放大
+            zoom = Swift.min(max(1.5, camera?.maxZoom ?? 2), zoom + 0.3)
+            camera?.setZoom(zoom)
+            flashToast("放大 \(String(format: "%.1f", zoom))x")
+        case 3: // 缩小
+            zoom = Swift.max(1.0, zoom - 0.3)
+            camera?.setZoom(zoom)
+            flashToast("缩小 \(String(format: "%.1f", zoom))x")
+        case 6: // 人脸跟踪切换
+            follow.enabled.toggle(); follow.reset()
+            flashToast(follow.enabled ? "跟踪已开" : "跟踪已关")
+        default:
+            break
         }
     }
 
