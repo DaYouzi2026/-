@@ -16,6 +16,9 @@ struct SettingsView: View {
     @AppStorage(Pref.mirrorSave) private var mirrorSave = true
     @AppStorage(Pref.followOn) private var followOn = true
     @AppStorage(Pref.speechOnDevice) private var speechOnDevice = false
+    /// 前后同拍 + 小窗大小（与拍摄页设置面板共用同一 key，改一处两处都同步）
+    @AppStorage(Pref.pip) private var pipOn = false
+    @AppStorage(Pref.pipSize) private var pipSize = 0.30
 
     @State private var toast: String?
     @State private var crashText: String?
@@ -286,6 +289,30 @@ struct SettingsView: View {
             row("arrow.left.arrow.right", T.accent2, "前置镜像保存",
                 sub: "成片和取景框同方向。关掉后自拍会存真实方向，左右反过来") {
                 Toggle("", isOn: $mirrorSave).labelsHidden().tint(T.accent)
+            }
+
+            RowDivider()
+
+            row("rectangle.on.rectangle", T.accent, "前后同拍（画中画）",
+                sub: "主画面拍场景，另一颗镜头的小窗一起录进视频。仅原相机模式可用") {
+                Toggle("", isOn: $pipOn).labelsHidden().tint(T.accent)
+            }
+            .onChange(of: pipOn) { v in CameraRecorder.shared.setPip(v) }
+
+            if pipOn {
+                RowDivider()
+
+                sliderBlock("rectangle.lefthalf.filled", T.accent2, "同拍小窗大小",
+                            $pipSize, 0.18...0.48, 0.01,
+                            "\(Int((pipSize * 100).rounded()))%")
+                    .onChange(of: pipSize) { v in DualCameraPip.shared.pipSizeRatio = v }
+
+                Text("拖动调节小窗尺寸，取景框和成片会一起变大变小")
+                    .font(.system(size: 11))
+                    .foregroundColor(T.sub)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 12)
             }
 
             RowDivider()

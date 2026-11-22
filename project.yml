@@ -20,7 +20,7 @@ targets:
       path: Tidanci/Info.plist
       properties:
         CFBundleDisplayName: 提词大师
-        CFBundleShortVersionString: "1.29"
+        CFBundleShortVersionString: "1.30"
         CFBundleVersion: "31"
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
@@ -37,8 +37,8 @@ targets:
         PRODUCT_NAME: Tidanci
         TARGETED_DEVICE_FAMILY: "1"
         SWIFT_VERSION: "5.0"
-        MARKETING_VERSION: "1.29"
-        CURRENT_PROJECT_VERSION: "31"
+        MARKETING_VERSION: "1.30"
+        CURRENT_PROJECT_VERSION: "32"
         GENERATE_INFOPLIST_FILE: NO
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGNING_REQUIRED: NO
