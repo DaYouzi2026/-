@@ -1,0 +1,61 @@
+name: build-tici
+
+# 独立的极简提词拍摄 App，和提词大师分开编译，互不影响。
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v4
+
+      - name: 装 XcodeGen
+        run: |
+          brew install xcodegen || brew upgrade xcodegen
+          xcodegen --version
+
+      - name: 生成 Xcode 工程
+        run: |
+          xcodegen generate
+          PBX=TiCi.xcodeproj/project.pbxproj
+          if [ -f "$PBX" ] && grep -q "objectVersion = 77;" "$PBX"; then
+            sed -i '' 's/objectVersion = 77;/objectVersion = 56;/' "$PBX"
+            sed -i '' '/preferredProjectObjectVersion/d' "$PBX"
+          fi
+          xcodebuild -version
+
+      - name: 编译提词拍摄
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project TiCi.xcodeproj \
+            -target TiCi \
+            -configuration Release \
+            -sdk iphoneos \
+            CONFIGURATION_BUILD_DIR="$PWD/out_tici" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: 打包成 ipa
+        run: |
+          APP="out_tici/TiCi.app"
+          test -d "$APP" || { echo "没有产物，编译失败"; ls -R out_tici || true; exit 1; }
+          rm -rf Payload TiCi.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry TiCi.ipa Payload
+          ls -lh TiCi.ipa
+          echo "内核大小：" && du -sh Payload/TiCi.app
+
+      - name: 上传安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: TiCi-ipa
+          path: TiCi.ipa
+          if-no-files-found: error

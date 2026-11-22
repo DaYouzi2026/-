@@ -18,7 +18,7 @@ jobs:
           set +e
           mkdir -p /tmp/parse
           fail=0
-          for f in Tidanci/*.swift; do
+          for f in Tidanci/*.swift TiCi/*.swift; do
             out=$(swiftc -parse "$f" 2>&1)
             if [ -n "$out" ]; then
               echo "=== $f ==="
