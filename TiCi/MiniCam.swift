@@ -1,6 +1,7 @@
 import AVFoundation
 import UIKit
 import Photos
+import SwiftUI
 
 /// 极简相机：取景 + 录像存相册。只用系统最稳的 AVCaptureMovieFileOutput，
 /// 不碰像素缓冲区、美颜、同拍那些复杂的东西，尽量少出错。
