@@ -1,11 +1,10 @@
 import Foundation
 import CoreBluetooth
 
-/// CoreBluetooth 云台连接（增强版）
-/// - 云台通常广播两个 BLE 身份：HID 拍照键（被 iOS 系统占用，App 扫不到）
-///   与 GATT 控制通道（FE00/02F00000 服务，用于转头）。本类寻找后者。
-/// - 扫描时记录广播的服务 UUID，即使设备无名称也能按服务识别。
-/// - 自动连接只尝试「候选设备」，连上后验证服务，验证失败自动断开换下一个。
+/// 云台 BLE 连接（2.3 稳健版）
+/// 诊断截图已证实云台开放了控制服务 02F00000-...-FE00 + 写 FF01 + 通知 FF02。
+/// 本版重点解决"连上又断开"：自动重连、只在当前设备上处理断开、
+/// 不再因为"没识别到服务"就主动踢掉连接、放宽写特征挑选。
 final class GCBLEManager: NSObject, ObservableObject,
                           CBCentralManagerDelegate, CBPeripheralDelegate {
 
@@ -18,8 +17,10 @@ final class GCBLEManager: NSObject, ObservableObject,
     @Published var diagnostics = ""
     @Published var lastConnectedName = ""
     @Published var lastButtonEvent = ""
+    @Published var foundControlChannel = false
+    @Published var reconnectCount = 0
 
-    /// 云台物理按键事件回调（来自 FF02 通知）：0=拍照 1=录像 2=放大 3=缩小 4=停止缩放 5=人脸跟踪切换
+    /// 云台物理按键事件：0=拍照 1=录像 2=放大 3=缩小 4=停止缩放 5=拍照或录像 6=人脸跟踪
     var onButton: ((Int) -> Void)?
 
     private var central: CBCentralManager!
@@ -28,14 +29,16 @@ final class GCBLEManager: NSObject, ObservableObject,
     private var allWriteChars: [CBCharacteristic] = []
     private var allNotifyChars: [CBCharacteristic] = []
 
-    private var autoQueue: [CBPeripheral] = []      // 待尝试的候选
-    private var autoIndex = 0
+    private var wantConnected = false
+    private var reconnectTries = 0
     private var connectTimer: Timer?
-    private var verifiedService = false
+    private var reconnectTimer: Timer?
 
-    private let knownWrite = ["FF01", "FFE1", "FFF1", "02F00000-0000-0000-0000-00000000FF01",
+    private let knownWrite = ["FF01", "FFF1", "FFE1",
+                              "02F00000-0000-0000-0000-00000000FF01",
                               "0000ff01-0000-1000-8000-00805f9b34fb"]
-    private let knownNotify = ["FF02", "FFE2", "FFF2", "02F00000-0000-0000-0000-00000000FF02",
+    private let knownNotify = ["FF02", "FFF2", "FFE2",
+                               "02F00000-0000-0000-0000-00000000FF02",
                                "0000ff02-0000-1000-8000-00805f9b34fb"]
 
     override init() {
@@ -49,6 +52,10 @@ final class GCBLEManager: NSObject, ObservableObject,
         case .poweredOn:
             stateText = "就绪 · 扫描中…"
             scan()
+        case .unauthorized:
+            stateText = "蓝牙未授权，请在设置中允许"
+        case .poweredOff:
+            stateText = "请打开蓝牙"
         default:
             stateText = "蓝牙不可用"
         }
@@ -58,19 +65,19 @@ final class GCBLEManager: NSObject, ObservableObject,
     func scan() {
         guard central.state == .poweredOn else { return }
         stateText = "扫描中…"
-        clearConnectTimer()
+        clearTimers()
         devices.removeAll()
         deviceRSSI.removeAll()
         deviceUUIDs.removeAll()
-        autoQueue.removeAll()
-        autoIndex = 0
         central.scanForPeripherals(withServices: nil,
                                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
-        DispatchQueue.main.asyncAfter(deadline: .now() + 9) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
             guard let self = self else { return }
             self.central.stopScan()
-            if !self.connected { self.autoConnectGimbal() }
-            self.refreshDiagnostics()
+            if !self.connected {
+                self.stateText = "扫描结束 · 连接中…"
+                self.autoConnectGimbal()
+            }
         }
     }
 
@@ -83,25 +90,23 @@ final class GCBLEManager: NSObject, ObservableObject,
         if !devices.contains(where: { $0.identifier == p.identifier }) {
             devices.append(p)
             devices.sort { a, b in
-                let ac = isCandidate(a), bc = isCandidate(b)
-                if ac != bc { return ac }
+                let sa = candidateScore(a), sb = candidateScore(b)
+                if sa != sb { return sa > sb }
                 return (deviceRSSI[a.identifier] ?? -100) > (deviceRSSI[b.identifier] ?? -100)
             }
         }
         refreshDiagnostics()
     }
 
-    /// 候选优先级：名字像云台(3) > 广播了控制服务UUID(2) > 强信号的未命名设备(1) > 其他(0)
     private func candidateScore(_ p: CBPeripheral) -> Int {
         if isGimbalName(p.name ?? "") { return 3 }
         if let uuids = deviceUUIDs[p.identifier] {
             for u in uuids {
                 let s = u.uppercased()
                 if s.contains("FE00") || s.contains("02F00000")
-                    || s.contains("FFE0") || s.contains("FFF0") { return 2 }
+                    || s.contains("FFE0") || s.contains("FFF0") || s.contains("FFFF") { return 2 }
             }
         }
-        // 无名称 + 信号较强：很可能是云台控制通道（不广播名字很常见）
         if p.name == nil && (deviceRSSI[p.identifier] ?? -100) > -80 { return 1 }
         return 0
     }
@@ -128,119 +133,94 @@ final class GCBLEManager: NSObject, ObservableObject,
         return "\(name) | \(r)dBm | \(isCandidate(p) ? "候选" : "其他") | \(uuids)"
     }
 
-    /// 自动连接：只对候选设备逐个尝试，连上验证服务失败则断开换下一个
+    /// 自动连接最合适的候选（只连一次，不来回踢）
     func autoConnectGimbal() {
-        autoQueue = devices.filter { candidateScore($0) > 0 }
+        guard !connected else { return }
+        let cands = devices.filter { candidateScore($0) > 0 }
             .sorted { a, b in
                 let sa = candidateScore(a), sb = candidateScore(b)
                 if sa != sb { return sa > sb }
                 return (deviceRSSI[a.identifier] ?? -100) > (deviceRSSI[b.identifier] ?? -100)
             }
-        autoIndex = 0
-        if autoQueue.isEmpty {
-            stateText = "未发现云台 · 请确认云台已开机"
-            addLog("扫描到的设备均非云台候选")
+        if let p = cands.first {
+            addLog("自动连接: \(p.name ?? "未命名")")
+            connect(p)
+        } else {
+            stateText = "未发现云台 · 请确认已开机"
             refreshDiagnostics()
-            return
         }
-        addLog("候选 \(autoQueue.count) 个，开始尝试")
-        tryNextCandidate()
-    }
-
-    private func tryNextCandidate() {
-        guard autoIndex < autoQueue.count else {
-            stateText = "候选均连接失败 · 需用 Gimbal Play 确认型号"
-            addLog("所有候选设备均未发现控制服务")
-            refreshDiagnostics()
-            return
-        }
-        let p = autoQueue[autoIndex]
-        autoIndex += 1
-        connect(p)
     }
 
     // MARK: - 连接
     func connect(_ p: CBPeripheral) {
-        clearConnectTimer()
+        clearTimers()
+        wantConnected = true
+        reconnectTries = 0
         stateText = "连接中… \(p.name ?? "未命名")"
         lastConnectedName = p.name ?? "未命名设备"
         peripheral = p
         p.delegate = self
         central.connect(p, options: nil)
-        // 连接+发现服务超时：8 秒没验证到就换下一个
-        connectTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: false) { [weak self] _ in
-            guard let self = self else { return }
-            if !self.verifiedService {
-                self.addLog("超时无控制服务，换下一个")
-                self.central.cancelPeripheralConnection(p)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.tryNextCandidate() }
-            }
+        connectTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: false) { [weak self] _ in
+            guard let self = self, !self.connected else { return }
+            self.addLog("连接超时（可能被系统HID占用）")
+            self.stateText = "连接超时 · 点重新连接"
         }
     }
 
-    private func clearConnectTimer() {
-        connectTimer?.invalidate()
-        connectTimer = nil
-    }
-
     func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
-        stateText = "已连接 · 验证服务…"
+        stateText = "已连接 · 发现服务…"
         addLog("已连接 \(p.name ?? "未命名")")
-        verifiedService = false
         allWriteChars.removeAll()
         allNotifyChars.removeAll()
+        writeChar = nil
+        diagnostics = "发现服务中…"
         p.discoverServices(nil)
     }
 
     func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
-        clearConnectTimer()
-        stateText = "连接失败 · 换下一个"
+        clearTimers()
+        stateText = "连接失败 · 点重新连接"
         addLog("连接失败: \(error?.localizedDescription ?? "未知")")
-        tryNextCandidate()
     }
 
     func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
-        clearConnectTimer()
-        if connected {
-            connected = false
-            stateText = "已断开 · 可重新扫描"
-            addLog("已断开")
+        clearTimers()
+        guard p.identifier == peripheral?.identifier else { return }   // 只处理当前设备，避免误判
+        let wasConnected = connected
+        connected = false
+        foundControlChannel = false
+        writeChar = nil
+        if wantConnected && reconnectTries < 8 {
+            reconnectTries += 1
+            reconnectCount = reconnectTries
+            stateText = "已断开 · 自动重连(\(reconnectTries)/8)…"
+            addLog("断开，2秒后重连 #\(reconnectTries)")
+            reconnectTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: false) { [weak self] _ in
+                guard let self = self, let p = self.peripheral else { return }
+                self.central.connect(p, options: nil)
+            }
+        } else {
+            stateText = "已断开 · 点重新连接"
+            if wasConnected { addLog("已断开") }
         }
     }
 
-    // MARK: - 服务 / 特征发现
+    // MARK: - 服务 / 特征
     func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
-        guard let services = p.services else { return }
-        addLog("发现 \(services.count) 个服务")
-        let hasControl = services.contains { s in
-            let u = s.uuid.uuidString.uppercased()
-            return u.contains("FE00") || u.contains("02F00000")
-        }
-        if hasControl {
-            verifiedService = true
-            clearConnectTimer()
-            stateText = "云台已连接 ✓"
-            connected = true
-            addLog("✓ 找到控制服务")
-        } else {
-            // 连上的不是云台控制通道，断开换下一个
-            addLog("非云台控制服务，断开")
-            refreshDiagnostics(services: services.map { $0.uuid.uuidString })
-            central.cancelPeripheralConnection(p)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                self?.tryNextCandidate()
-            }
+        guard let services = p.services, !services.isEmpty else {
+            diagnostics = "未发现服务（该设备可能只有 HID）"
+            stateText = "无控制服务 · 请忽略系统蓝牙配对后重试"
             return
         }
+        addLog("发现 \(services.count) 个服务")
         for s in services { p.discoverCharacteristics(nil, for: s) }
         refreshDiagnostics(services: services.map { $0.uuid.uuidString })
     }
 
     func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor s: CBService, error: Error?) {
         guard let chars = s.characteristics else { return }
-        var lines = diagnostics.components(separatedBy: "\n")
         for ch in chars {
-            lines.append("  └ \(ch.uuid.uuidString) [\(flags(ch))]")
             if ch.properties.contains(.write) || ch.properties.contains(.writeWithoutResponse) {
                 allWriteChars.append(ch)
             }
@@ -249,34 +229,35 @@ final class GCBLEManager: NSObject, ObservableObject,
                 p.setNotifyValue(true, for: ch)
             }
         }
-        diagnostics = lines.joined(separator: "\n")
         pickCharacteristics()
-    }
-
-    private func flags(_ c: CBCharacteristic) -> String {
-        var f = ""
-        if c.properties.contains(.write) { f += "W" }
-        if c.properties.contains(.writeWithoutResponse) { f += "WNR" }
-        if c.properties.contains(.notify) { f += "N" }
-        if c.properties.contains(.read) { f += "R" }
-        return f.isEmpty ? "-" : f
     }
 
     private func rank(_ ch: CBCharacteristic, _ known: [String]) -> Int {
         let u = ch.uuid.uuidString.uppercased()
-        for (i, k) in known.enumerated() where u == k || u.hasSuffix(k) { return 100 - i }
+        for (i, k) in known.enumerated() where u == k.uppercased() || u.hasSuffix(k.uppercased()) {
+            return 100 - i
+        }
         return 0
     }
 
     private func pickCharacteristics() {
         guard let best = allWriteChars.sorted(by: { rank($0, knownWrite) > rank($1, knownWrite) }).first
         else { return }
-        writeChar = best
-        connected = true
-        stateText = "云台已连接 ✓"
-        addLog("控制通道: \(best.uuid.uuidString)")
+        if writeChar?.uuid != best.uuid {
+            writeChar = best
+            addLog("控制写通道: \(best.uuid.uuidString)")
+        }
         for ch in allNotifyChars.sorted(by: { rank($0, knownNotify) > rank($1, knownNotify) }) {
             peripheral?.setNotifyValue(true, for: ch)
+        }
+        if !connected {
+            connected = true
+            foundControlChannel = true
+            reconnectTries = 0
+            reconnectCount = 0
+            stateText = "云台已连接 ✓"
+            addLog("✓ 控制通道就绪，可以发指令")
+            refreshDiagnostics()
         }
     }
 
@@ -287,70 +268,49 @@ final class GCBLEManager: NSObject, ObservableObject,
         parseButtonNotify(bytes)
     }
 
-    /// 解析云台 FF02 通知里的物理按键事件。
-    /// 逆向 Gimbal Play: 通知帧与下发同构 FF FF [lenH][lenL][ch][内层帧][crc]，
-    /// 内层帧第 4 字节是命令码；按键事件命令码走 command 分发。
-    /// l70 事件枚举值：TakePicture=2, TakeVideo=3, TakePictureOrVideo=4,
-    /// ZoomIn=9, ZoomOut=10, ZoomIn2=11, ZoomOut2=12, StopZoom=13, FaceTraceToggle=17。
+    /// 解析云台 FF02 通知里的物理按键事件（事件码同 Gimbal Play 的 l70 枚举）
     private func parseButtonNotify(_ b: [UInt8]) {
-        // 找到 FF FF 头
-        var start = -1
-        for i in 0..<max(0, b.count - 1) where b[i] == 0xFF && b[i+1] == 0xFF {
-            start = i; break
-        }
-        let frame = start >= 0 ? Array(b[start...]) : b
-        // 内层帧格式: 55 02 0B CMD n n [payload] checksum
-        // 找到 0x55 起点
+        var frame = b
+        // 去外层 FF FF lenHi lenLo
+        if b.count > 4, b[0] == 0xFF, b[1] == 0xFF { frame = Array(b[4...]) }
+        // 找内层 55 02
         var inner = -1
         for i in 0..<max(0, frame.count - 4) where frame[i] == 0x55 && frame[i+1] == 0x02 {
             inner = i; break
         }
-        guard inner >= 0, inner + 4 < frame.count else { return }
+        guard inner >= 0, inner + 3 < frame.count else { return }   // 未识别成帧就不乱判
         let cmd = frame[inner + 3]
-        let payload: [UInt8] = inner + 6 <= frame.count - 1
-            ? Array(frame[(inner+6)..<(frame.count-1)]) : []
-
         var event: Int? = nil
-        switch cmd {
-        case 0x22: // 开关/拍照类
-            if let p0 = payload.first {
-                switch p0 {
-                case 2: event = 0       // TakePicture 拍照
-                case 3: event = 1       // TakeVideo 录像
-                case 4: event = 5       // 拍照或录像
-                case 9: event = 2       // ZoomIn 放大
-                case 10: event = 3      // ZoomOut 缩小
-                case 11: event = 2      // 连续放大
-                case 12: event = 3      // 连续缩小
-                case 13: event = 4      // StopZoom
-                case 17: event = 6      // FaceTraceToggle
-                default: break
-                }
-            }
-        case 0x31: // 模式变化
-            if let p0 = payload.first {
-                switch p0 {
-                case 2: event = 0
-                case 3: event = 1
-                case 9: event = 2
-                case 10: event = 3
-                default: break
-                }
-            }
-        default: break
+        if cmd == 0x22 || cmd == 0x31, inner + 6 < frame.count {
+            event = mapEvent(frame[inner + 6])
+        } else {
+            event = mapEvent(cmd)
         }
         if let e = event {
-            let names = ["拍照", "录像", "放大", "缩小", "停止缩放", "拍照/录像", "人脸跟踪切换"]
+            let names = ["拍照", "录像", "放大", "缩小", "停止缩放", "拍照/录像", "人脸跟踪"]
             lastButtonEvent = names[e]
             addLog("★按键: \(names[e])")
             onButton?(e)
         }
     }
 
+    private func mapEvent(_ v: UInt8) -> Int? {
+        switch v {
+        case 2: return 0          // TakePicture
+        case 3: return 1          // TakeVideo
+        case 4: return 5          // TakePictureOrVideo
+        case 9, 11: return 2      // ZoomIn / ZoomIn2
+        case 10, 12: return 3     // ZoomOut / ZoomOut2
+        case 13: return 4         // StopZoom
+        case 17: return 6         // FaceTraceToggle
+        default: return nil
+        }
+    }
+
     // MARK: - 发指令
     private var lastWrite: TimeInterval = 0
     func send(_ data: [UInt8]) {
-        guard connected, peripheral != nil, writeChar != nil else {
+        guard connected, let p = peripheral, let ch = writeChar else {
             addLog("未连接控制通道，指令未发出")
             return
         }
@@ -373,7 +333,7 @@ final class GCBLEManager: NSObject, ObservableObject,
 
     private func addLog(_ s: String) {
         logs.insert(s, at: 0)
-        if logs.count > 14 { logs.removeLast() }
+        if logs.count > 16 { logs.removeLast() }
     }
 
     private func refreshDiagnostics(services: [String]? = nil) {
@@ -381,15 +341,33 @@ final class GCBLEManager: NSObject, ObservableObject,
         lines.append("扫描到 \(devices.count) 个设备：")
         for p in devices { lines.append(deviceDetail(p)) }
         if let svcs = services {
-            lines.append("已连接设备服务：")
+            lines.append("设备服务：")
             lines.append(contentsOf: svcs)
+        }
+        if let ch = writeChar {
+            lines.append("已选写特征：\(ch.uuid.uuidString)")
         }
         diagnostics = lines.joined(separator: "\n")
     }
 
+    private func clearTimers() {
+        connectTimer?.invalidate(); connectTimer = nil
+        reconnectTimer?.invalidate(); reconnectTimer = nil
+    }
+
     func disconnect() {
-        clearConnectTimer()
+        wantConnected = false
+        clearTimers()
         if let p = peripheral { central.cancelPeripheralConnection(p) }
         connected = false
+    }
+
+    /// 手动重连（UI 按钮）
+    func reconnect() {
+        guard let p = peripheral else { scan(); return }
+        wantConnected = true
+        reconnectTries = 0
+        stateText = "重新连接…"
+        central.connect(p, options: nil)
     }
 }

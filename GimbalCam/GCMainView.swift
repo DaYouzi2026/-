@@ -261,16 +261,22 @@ struct GCMainView: View {
                     }
                 }
             }
-            // 诊断信息：发现到的服务与特征
-            HStack {
+            // 状态行 + 重连
+            HStack(spacing: 10) {
+                Circle().fill(ble.connected ? Color.green : Color.red)
+                    .frame(width: 7, height: 7)
+                Text(ble.connected ? "控制通道已就绪" : "未连接控制通道")
+                    .font(.caption).foregroundColor(ble.connected ? .green : .red)
+                Spacer()
+                Button("重新连接") { ble.reconnect(); flashToast("正在重连云台") }
+                    .foregroundColor(.cyan).font(.caption)
                 Button(showDiagnostics ? "隐藏诊断" : "BLE诊断") {
                     withAnimation { showDiagnostics.toggle() }
                 }.foregroundColor(.orange).font(.caption)
-                Spacer()
             }
             if showDiagnostics {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("说明：若系统蓝牙已连云台(HID拍照)，App 通常扫不到它的控制通道。")
+                    Text("⚠️ 若一直断开：去 iPhone 设置→蓝牙→Gimbal Go 右边的ⓘ→「忽略此设备」，\n然后回这里点「重新连接」。系统HID占用会让云台只肯连一路。")
                         .font(.system(size: 9)).foregroundColor(.yellow)
                     ScrollView {
                         VStack(alignment: .leading, spacing: 2) {
