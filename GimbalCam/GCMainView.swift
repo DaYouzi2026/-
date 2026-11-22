@@ -44,8 +44,11 @@ struct GCPreview: UIViewRepresentable {
 struct GCMainView: View {
     @StateObject private var ble = GCBLEManager()
     @StateObject private var follow = GCFollowEngine()
+    private let volumeShutter = GCVolumeShutter()
 
     @State private var camera: GCCamera?
+    @State private var shutterEnabled = true
+    @State private var showDiagnostics = false
     @State private var cameraStatus = "相机启动中…"
 
     // 拍摄
@@ -147,8 +150,12 @@ struct GCMainView: View {
         }
         .animation(.easeInOut(duration: 0.2), value: showPrompter)
         .statusBar(hidden: true)
-        .onAppear { setupCamera() }
-        .onDisappear { camera?.stop(); ble.disconnect() }
+        .onAppear {
+            setupCamera()
+            volumeShutter.onShutter = { shoot() }
+            volumeShutter.start()
+        }
+        .onDisappear { camera?.stop(); ble.disconnect(); volumeShutter.stop() }
     }
 
     // MARK: - 初始化相机
@@ -223,14 +230,16 @@ struct GCMainView: View {
     private var deviceList: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("附近蓝牙设备").foregroundColor(.white).font(.caption)
+                Text("附近蓝牙设备 · \(ble.stateText)").foregroundColor(.white).font(.caption)
                 Spacer()
                 Button("扫描") { ble.scan() }.foregroundColor(.cyan).font(.caption)
+                Button("自动连云台") { ble.autoConnectGimbal(); flashToast("自动连接最强云台信号") }
+                    .foregroundColor(.green).font(.caption)
                 Button("收起") { withAnimation { showDevices = false } }
                     .foregroundColor(.gray).font(.caption)
             }
             if ble.devices.isEmpty {
-                Text(ble.stateText).foregroundColor(.gray).font(.caption)
+                Text("未发现设备，请确认云台已开机").foregroundColor(.gray).font(.caption)
             } else {
                 ScrollView(.horizontal) {
                     HStack(spacing: 8) {
@@ -239,7 +248,7 @@ struct GCMainView: View {
                                 ble.connect(d)
                                 flashToast("正在连接 \(d.name ?? "设备")")
                             } label: {
-                                Text(d.name ?? "设备")
+                                Text(ble.deviceLabel(d))
                                     .font(.caption).foregroundColor(.white)
                                     .padding(.horizontal, 12).padding(.vertical, 7)
                                     .background(Color.blue.opacity(0.75)).cornerRadius(14)
@@ -248,9 +257,29 @@ struct GCMainView: View {
                     }
                 }
             }
+            // 诊断信息：发现到的服务与特征
+            HStack {
+                Button(showDiagnostics ? "隐藏诊断" : "BLE诊断") {
+                    withAnimation { showDiagnostics.toggle() }
+                }.foregroundColor(.orange).font(.caption)
+                Spacer()
+            }
+            if showDiagnostics {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("已知设备: \(ble.lastConnectedName)").foregroundColor(.cyan)
+                        ForEach(ble.logs, id: \.self) { l in
+                            Text(l).font(.system(size: 9, design: .monospaced)).foregroundColor(.green)
+                        }
+                        Text(ble.diagnostics)
+                            .font(.system(size: 9, design: .monospaced)).foregroundColor(.white)
+                    }
+                }
+                .frame(maxHeight: 130)
+            }
         }
         .padding(12)
-        .background(Color.black.opacity(0.75)).cornerRadius(12)
+        .background(Color.black.opacity(0.8)).cornerRadius(12)
         .padding(.horizontal, 16)
     }
 
@@ -354,12 +383,27 @@ struct GCMainView: View {
 
     // MARK: - 跟踪提示
     private var trackingIndicator: some View {
-        Text(follow.orientationLocked ? "跟踪中 · 横竖屏已锁定" : "跟踪中 · 画面稳定确认中…")
-            .font(.caption).foregroundColor(.white)
-            .padding(.horizontal, 12).padding(.vertical, 6)
-            .background(Color.green.opacity(0.75)).cornerRadius(14)
-            .frame(maxHeight: .infinity, alignment: .top)
-            .padding(.top, 120)
+        VStack(spacing: 5) {
+            if ble.connected {
+                Text(follow.orientationLocked ? "跟踪中 · 横竖屏已锁定" : "跟踪中 · 画面稳定确认中…")
+                    .font(.caption).foregroundColor(.white)
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(Color.green.opacity(0.75)).cornerRadius(14)
+            } else {
+                // 跟随开着但没连上控制通道 —— 明确告诉用户为什么云台不动
+                VStack(spacing: 3) {
+                    Text("⚠️ 未连接云台控制通道 · 云台不会转动")
+                        .font(.caption).foregroundColor(.white)
+                    Text("点顶部「连接云台」→ 选带 ★云台 的设备")
+                        .font(.system(size: 10)).foregroundColor(.white.opacity(0.85))
+                }
+                .padding(.horizontal, 12).padding(.vertical, 7)
+                .background(Color.orange.opacity(0.85)).cornerRadius(12)
+                .onTapGesture { withAnimation { showDevices = true } }
+            }
+        }
+        .frame(maxHeight: .infinity, alignment: .top)
+        .padding(.top, 120)
     }
 
     // MARK: - 云台控制面板
@@ -420,6 +464,17 @@ struct GCMainView: View {
                     Text("设置").font(.title3.bold()).foregroundColor(.white)
                     Spacer()
                     Button("关闭") { showSettings = false }.foregroundColor(.gray)
+                }
+
+                Group {
+                    Text("拍照按键").font(.headline).foregroundColor(.white)
+                    Toggle("云台拍照键当快门", isOn: $shutterEnabled)
+                        .foregroundColor(.white)
+                        .onChange(of: shutterEnabled) { on in
+                            if on { volumeShutter.start() } else { volumeShutter.stop() }
+                        }
+                    Text("开启后，按云台上的拍照键（手机会显示为音量键）即可拍照/录像")
+                        .font(.caption).foregroundColor(.gray)
                 }
 
                 Group {
