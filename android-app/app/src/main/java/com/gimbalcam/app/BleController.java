@@ -101,6 +101,10 @@ public class BleController {
                 if (ok) {
                     connected = true;
                     listener.onState("已就绪 ✓ (UUID变体" + uuidVariant + ")");
+                    // 关键：原版连接成功后 500ms 发握手帧 GW20 授权云台。
+                    // 不发这一帧，云台不会响应任何转头/跟随指令 —— 这是"连上没反应"的根因。
+                    handshakeStep = 0;
+                    main.postDelayed(this::sendHandshake, 500);
                 } else {
                     listener.onState("未找到控制特征");
                 }
@@ -158,6 +162,33 @@ public class BleController {
         } catch (SecurityException e) {
             listener.onLog("写入失败: 权限");
         }
+    }
+
+    // ---- 连接握手：依次尝试原版的几种授权帧，覆盖不同型号/加密变体 ----
+    private int handshakeStep = 0;
+    private void sendHandshake() {
+        if (!connected || writeChar == null) return;
+        final byte[][] candidates = new byte[][]{
+                GimbalProtocol.handshakeGW20(),      // 最常见：非加密 GW20 累加和
+                GimbalProtocol.handshakeGW20Crc(),   // 加密型号 GW20 CRC8
+                GimbalProtocol.handshakeGW10()       // AFI_V5_New：GW10
+        };
+        final String[] names = {"GW20(累加和)", "GW20(CRC8)", "GW10"};
+        if (handshakeStep >= candidates.length) {
+            listener.onState("已就绪 ✓ 握手已发(" + (candidates.length) + "种), 请试转头");
+            return;
+        }
+        listener.onLog("握手 " + (handshakeStep + 1) + "/" + candidates.length
+                + " " + names[handshakeStep] + ": " + GimbalProtocol.hex(candidates[handshakeStep]));
+        doWrite(candidates[handshakeStep]);
+        handshakeStep++;
+        main.postDelayed(this::sendHandshake, 400);
+    }
+
+    /** 手动重发握手（诊断面板按钮） */
+    public void resendHandshake() {
+        handshakeStep = 0;
+        main.post(this::sendHandshake);
     }
 
     public void disconnect() {

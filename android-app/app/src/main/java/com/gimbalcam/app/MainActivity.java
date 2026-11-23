@@ -242,7 +242,12 @@ public class MainActivity extends AppCompatActivity {
         diagInfo.setText("连接状态见顶部。发命令后看右下日志：\n→ 是自己发的帧，← 是云台回的帧。");
         p.addView(diagInfo);
 
-        p.addView(label("① 先测手动转头（点左/右，看云台动不动）"));
+        p.addView(label("① 握手授权（连上自动发；没反应就手动重发）"));
+        LinearLayout hs = new LinearLayout(this);
+        hs.addView(btn("重发握手", v -> { ble.resendHandshake(); toast("已依次重发 GW20/GW10 三种握手帧"); }));
+        p.addView(hs);
+
+        p.addView(label("② 手动转头（点左/右，看云台动不动）"));
         LinearLayout dir = new LinearLayout(this);
         dir.addView(btn("左", v -> sendTurn(-400, 0)));
         dir.addView(btn("停", v -> sendTurn(0, 0)));
@@ -251,14 +256,14 @@ public class MainActivity extends AppCompatActivity {
         dir.addView(btn("下", v -> sendTurn(0, -400)));
         p.addView(dir);
 
-        p.addView(label("② 转头没动？逐条试初始化帧（每点一次等 1 秒看云台）"));
+        p.addView(label("③ 转头没动？逐条试初始化帧（每点一次等 1 秒看云台）"));
         LinearLayout init = new LinearLayout(this);
         init.addView(btn("复位0x22", v -> { ble.send(GimbalProtocol.initReset22()); log("已发初始化帧 0x22 复位"); }));
         init.addView(btn("开关0x49", v -> { ble.send(GimbalProtocol.initToggle49()); log("已发初始化帧 0x49 开关"); }));
         init.addView(btn("模式0x31", v -> { ble.send(GimbalProtocol.initMode31()); log("已发初始化帧 0x31 模式"); }));
         p.addView(init);
 
-        p.addView(label("③ 还不动？切协议变体（每切一次重测转头）"));
+        p.addView(label("④ 还不动？切协议变体（每切一次重测转头）"));
         LinearLayout var = new LinearLayout(this);
         spChannel = spinner(new String[]{"通道3(默认)", "通道2"}, 0, pos -> GimbalProtocol.channel = pos==0?3:2);
         spInnerCs = spinner(new String[]{"内层校验开", "内层校验关"}, 0, pos -> GimbalProtocol.innerChecksum = pos==0);
@@ -266,7 +271,7 @@ public class MainActivity extends AppCompatActivity {
         var.addView(spChannel); var.addView(spInnerCs); var.addView(spOuterCrc);
         p.addView(var);
 
-        p.addView(label("④ 蓝牙列表 / 重扫"));
+        p.addView(label("⑤ 蓝牙列表 / 重扫"));
         p.addView(btn("重新扫描云台", v -> { ble.scan(); toast("已开始扫描"); }));
         p.addView(btn("关闭自检", v -> toggleDiag()));
         return p;

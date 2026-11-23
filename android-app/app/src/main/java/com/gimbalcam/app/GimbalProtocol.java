@@ -162,6 +162,69 @@ public final class GimbalProtocol {
         return wrap(innerFrame((byte) 0x02, CMD_MODE, new byte[]{0, 0}));
     }
 
+    // ============================================================
+    // 握手帧 —— 逆向自原版 getAppConnected()，是"连上没反应"的根因
+    // 原版连接成功后发 ASCII "GW20" 让云台授权；不发则所有转头指令被忽略。
+    // 封装 = FF FF [lenHi][lenLo][channel=3] [ASCII payload] [check]
+    //   len 字段 = payload.length + 2；check 累加和(非加密) / CRC8(加密型号)
+    // ============================================================
+
+    /** 官方 gp1.OooO0Oo(channel, payload, check) 封装，与二进制帧共用同一外层 */
+    private static byte[] wrapPayload(byte[] payload, boolean useCrc) {
+        int lenField = payload.length + 2;
+        byte[] core = new byte[3 + payload.length];
+        core[0] = (byte) ((lenField >> 8) & 0xFF);
+        core[1] = (byte) (lenField & 0xFF);
+        core[2] = (byte) channel;              // 默认 3
+        System.arraycopy(payload, 0, core, 3, payload.length);
+
+        byte check;
+        if (useCrc) {
+            check = crc8(core, core.length);   // 覆盖 lenHi..payload 末尾
+        } else {
+            int sum = 0;
+            for (byte b : core) sum += (b & 0xFF);
+            check = (byte) (sum & 0xFF);       // gp1.OooO00o 累加和
+        }
+        byte[] out = new byte[2 + core.length + 1];
+        out[0] = (byte) 0xFF;
+        out[1] = (byte) 0xFF;
+        System.arraycopy(core, 0, out, 2, core.length);
+        out[out.length - 1] = check;
+        return out;
+    }
+
+    /** ASCII 转字节（原版握手帧是 ASCII 字符串） */
+    private static byte[] ascii(String s) {
+        byte[] b = new byte[s.length()];
+        for (int i = 0; i < s.length(); i++) b[i] = (byte) s.charAt(i);
+        return b;
+    }
+
+    /**
+     * GW20 握手帧（非加密型号，累加和校验）——最常见。
+     * 原版 o82.OooO00o = {71,87,50,48,0,0} = "GW20\0\0"
+     * 结果: FF FF 00 08 03 47 57 32 30 00 00 0B
+     */
+    public static byte[] handshakeGW20() {
+        return wrapPayload(ascii("GW20\u0000\u0000"), false);
+    }
+
+    /** GW20 握手帧（加密型号，CRC8 校验） */
+    public static byte[] handshakeGW20Crc() {
+        return wrapPayload(ascii("GW20\u0000\u0000"), true);
+    }
+
+    /** GW10 握手帧（AFI_V5_New 型号，原版 o82.OooO0O0 = "GW10\0\x30"） */
+    public static byte[] handshakeGW10() {
+        return wrapPayload(new byte[]{71,87,49,48,0,48}, false);
+    }
+
+    /** 断开帧 GW21（原版 getAppDisConnected） */
+    public static byte[] goodbyeGW21() {
+        return wrapPayload(new byte[]{71,87,50,49,0,0}, false);
+    }
+
     private static int clamp(int v, int lo, int hi) {
         return Math.max(lo, Math.min(hi, v));
     }
