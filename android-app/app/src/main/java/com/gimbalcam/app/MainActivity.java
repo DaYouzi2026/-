@@ -340,7 +340,8 @@ public class MainActivity extends AppCompatActivity {
 
     private void appendLog(String l) {
         logText.setText(l + "\n" + logText.getText());
-        if (logText.getText().length() > 500) logText.setText(logText.getText().substring(0, 400));
+        String cur = logText.getText().toString();
+        if (cur.length() > 500) logText.setText(cur.substring(0, 400));
     }
     private void log(String s) { appendLog("· " + s); }
 
