@@ -65,17 +65,24 @@ public final class GimbalProtocol {
         return out;
     }
 
-    /** 外层封装: FF FF [lenHi][lenLo][channel][inner][crc/累加] */
+    /**
+     * 外层封装: FF FF [lenHi][lenLo][channel][inner][crc]
+     * 长度字段 = 内层长度 + 2（通道1字节 + CRC1字节）——逆向 gp1.OooO0Oo 确认。
+     * 之前写成 +1 导致云台长度校验失败直接丢包，是"连上没反应"的根因。
+     */
     public static byte[] wrap(byte[] inner) {
-        int coreLen = inner.length + 1;          // 通道 + 内层帧
-        byte[] core = new byte[2 + coreLen];     // [lenHi][lenLo][channel][inner...]
-        core[0] = (byte) ((coreLen >> 8) & 0xFF);
-        core[1] = (byte) (coreLen & 0xFF);
+        // 逆向 gp1.OooO0Oo 确认：长度字段 = 内层长度 + 2（通道1 + CRC1）
+        int lenField = inner.length + 2;
+        // core = [lenHi][lenLo][channel][inner...]，长度固定 3 + inner.length
+        byte[] core = new byte[3 + inner.length];
+        core[0] = (byte) ((lenField >> 8) & 0xFF);
+        core[1] = (byte) (lenField & 0xFF);
         core[2] = (byte) channel;
         System.arraycopy(inner, 0, core, 3, inner.length);
 
         byte check;
         if (outerCrc) {
+            // CRC 覆盖整个 core（lenHi..inner 末尾），等价于官方 ye3.OooOO0(v4, n+3)
             check = crc8(core, core.length);
         } else {
             int sum = 0;
@@ -83,7 +90,7 @@ public final class GimbalProtocol {
             check = (byte) (sum & 0xFF);
         }
 
-        byte[] out = new byte[2 + core.length + 1];
+        byte[] out = new byte[2 + core.length + 1];  // FF FF + core + CRC
         out[0] = (byte) 0xFF;
         out[1] = (byte) 0xFF;
         System.arraycopy(core, 0, out, 2, core.length);
@@ -120,6 +127,39 @@ public final class GimbalProtocol {
     /** 开关指令: 0x22 + 0/1 */
     public static byte[] toggle(boolean on) {
         return wrap(innerFrame((byte) 0x02, CMD_TOGGLE, new byte[]{(byte) (on ? 1 : 0)}));
+    }
+
+    /**
+     * 初始化/复位候选帧（逆向 oO00Oo0.OooOo00）。
+     * 不同型号 Initialize 帧不同，放在自检面板里让真机逐条试，不自动发。
+     * 候选1：0x49 六字节全 0（proType==2 的 OooOo0）
+     */
+    public static byte[] initToggle49() {
+        return wrap(innerFrame((byte) 0x02, CMD_SWITCH6,
+                new byte[]{0, 0, 0, 0, 0, 0}));
+    }
+
+    /**
+     * 候选2：0x22 复位帧 AA 55 00 08 22 02 00 00 00 00 00 00（proType==9，非F10）
+     * 此帧内层首字节为 0xAA、长度字段 0x08，与普通帧不同，单独构造。
+     */
+    public static byte[] initReset22() {
+        byte[] inner = new byte[]{
+                (byte) 0xAA, 0x55, 0x00, 0x08, 0x22, 0x02,
+                0, 0, 0, 0, 0, 0
+        };
+        // 内层累加校验（从第2字节起）
+        int s = 0;
+        for (int i = 1; i < inner.length; i++) s += (inner[i] & 0xFF);
+        byte[] framed = new byte[inner.length + 1];
+        System.arraycopy(inner, 0, framed, 0, inner.length);
+        framed[inner.length] = (byte) (s & 0xFF);
+        return wrap(framed);
+    }
+
+    /** 候选3：0x31 模式设置 两字节全 0 */
+    public static byte[] initMode31() {
+        return wrap(innerFrame((byte) 0x02, CMD_MODE, new byte[]{0, 0}));
     }
 
     private static int clamp(int v, int lo, int hi) {
