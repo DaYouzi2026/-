@@ -104,7 +104,7 @@ public class BleController {
                     // 关键：原版连接成功后 500ms 发握手帧 GW20 授权云台。
                     // 不发这一帧，云台不会响应任何转头/跟随指令 —— 这是"连上没反应"的根因。
                     handshakeStep = 0;
-                    main.postDelayed(this::sendHandshake, 500);
+                    main.postDelayed(BleController.this::sendHandshake, 500);
                 } else {
                     listener.onState("未找到控制特征");
                 }
